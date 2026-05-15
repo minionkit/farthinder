@@ -1,30 +1,37 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use hyper::body::Incoming;
-use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
+use url::Url;
 
 use crate::cert::CaState;
-use crate::registry::Ecosystem;
+use crate::registry::{Ecosystem, Registry, VersionInfo};
+use crate::rule::{MinimumAge, RuleVerdict};
 
 #[derive(Debug, Clone, Default)]
 pub struct ProxyStats {
     pub connections_tunneled: usize,
-    pub connections_intercepted: usize,
-    pub requests_inspected: usize,
-    pub versions_suppressed: Vec<SuppressedItem>,
+    pub packages_checked: usize,
+    pub packages_quarantined: Vec<QuarantinedPackage>,
     pub downloads_blocked: Vec<BlockedItem>,
 }
 
 #[derive(Debug, Clone)]
-pub struct SuppressedItem {
-    pub package: String,
+pub struct QuarantinedPackage {
+    pub name: String,
+    pub quarantined_versions: Vec<QuarantinedVersion>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuarantinedVersion {
     pub version: String,
+    pub published_at: Option<jiff::Timestamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +42,7 @@ pub struct BlockedItem {
 
 impl ProxyStats {
     pub fn active(&self) -> bool {
-        self.connections_intercepted > 0 || self.connections_tunneled > 0
+        self.packages_checked > 0 || self.connections_tunneled > 0
     }
 }
 
@@ -47,7 +54,10 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    pub async fn spawn(ecosystem: Option<Ecosystem>) -> anyhow::Result<Self> {
+    pub async fn spawn(
+        ecosystem: Option<Ecosystem>,
+        rule: Option<MinimumAge>,
+    ) -> anyhow::Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .context("bind proxy port")?;
@@ -61,7 +71,14 @@ impl ProxyServer {
         let stats = Arc::new(Mutex::new(ProxyStats::default()));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(run(listener, ecosystem, ca_state, stats.clone(), shutdown_rx));
+        tokio::spawn(run(
+            listener,
+            ecosystem,
+            ca_state,
+            stats.clone(),
+            rule,
+            shutdown_rx,
+        ));
 
         Ok(ProxyServer {
             shutdown_tx,
@@ -85,6 +102,7 @@ async fn run(
     ecosystem: Option<Ecosystem>,
     ca_state: Arc<Mutex<CaState>>,
     stats: Arc<Mutex<ProxyStats>>,
+    rule: Option<MinimumAge>,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     loop {
@@ -95,8 +113,9 @@ async fn run(
                 let ec = ecosystem;
                 let ca = ca_state.clone();
                 let st = stats.clone();
+                let r = rule;
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, ec, ca, st).await {
+                    if let Err(e) = handle_connection(stream, ec, ca, st, r).await {
                         warn!("connection error: {:#}", e);
                     }
                 });
@@ -111,6 +130,7 @@ async fn handle_connection(
     ecosystem: Option<Ecosystem>,
     ca_state: Arc<Mutex<CaState>>,
     stats: Arc<Mutex<ProxyStats>>,
+    rule: Option<MinimumAge>,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut first_line = Vec::new();
@@ -120,7 +140,7 @@ async fn handle_connection(
     if line.starts_with("CONNECT ") {
         let host_port = parse_connect_host(&line)?;
         let stream = reader.into_inner();
-        handle_connect(stream, &host_port, ecosystem, ca_state, stats).await
+        handle_connect(stream, &host_port, ecosystem, ca_state, stats, rule).await
     } else {
         handle_http(reader, first_line).await
     }
@@ -147,25 +167,22 @@ async fn handle_connect(
     ecosystem: Option<Ecosystem>,
     ca_state: Arc<Mutex<CaState>>,
     stats: Arc<Mutex<ProxyStats>>,
+    rule: Option<MinimumAge>,
 ) -> anyhow::Result<()> {
     let (host, port) = parse_host_port(host_port);
+    debug!("CONNECT {}:{} (ecosystem={:?})", host, port, ecosystem);
 
-    if let Some(ec) = ecosystem {
-        if ec.matches_host(&host) {
-            stats.lock().unwrap().connections_intercepted += 1;
-            return handle_mitm(client, host, port, ec, ca_state, stats).await;
-        }
+    if let Some(ec) = ecosystem
+        && ec.matches_host(&host)
+    {
+        return handle_mitm(client, host, port, ec, ca_state, stats, rule).await;
     }
 
     stats.lock().unwrap().connections_tunneled += 1;
     handle_tunnel(client, &host, port).await
 }
 
-async fn handle_tunnel(
-    mut client: TcpStream,
-    host: &str,
-    port: u16,
-) -> anyhow::Result<()> {
+async fn handle_tunnel(mut client: TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
     let mut target = TcpStream::connect((host, port))
         .await
         .with_context(|| format!("connect to {}:{}", host, port))?;
@@ -189,24 +206,23 @@ async fn handle_mitm(
     ecosystem: Ecosystem,
     ca_state: Arc<Mutex<CaState>>,
     stats: Arc<Mutex<ProxyStats>>,
+    rule: Option<MinimumAge>,
 ) -> anyhow::Result<()> {
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
-    let acceptor = ca_state
-        .lock()
-        .unwrap()
-        .tls_acceptor_for_host(&host)?;
+    let acceptor = ca_state.lock().unwrap().tls_acceptor_for_host(&host)?;
     let tls_stream = acceptor.accept(client).await?;
 
     let io = TokioIo::new(tls_stream);
-    let registry = ecosystem.registry();
+    let registry: Arc<dyn Registry> = Arc::from(ecosystem.registry());
     let svc = MitmService {
         host,
         port,
         registry,
         stats,
+        rule,
     };
 
     hyper::server::conn::http1::Builder::new()
@@ -219,8 +235,9 @@ async fn handle_mitm(
 struct MitmService {
     host: String,
     port: u16,
-    registry: Box<dyn crate::registry::Registry>,
+    registry: Arc<dyn Registry>,
     stats: Arc<Mutex<ProxyStats>>,
+    rule: Option<MinimumAge>,
 }
 
 impl hyper::service::Service<hyper::Request<Incoming>> for MitmService {
@@ -234,13 +251,135 @@ impl hyper::service::Service<hyper::Request<Incoming>> for MitmService {
         let host = self.host.clone();
         let port = self.port;
         let stats = self.stats.clone();
+        let registry = self.registry.clone();
+        let rule = self.rule;
+
+        let uri = req.uri().to_string();
+        let parsed_url = Url::parse(&format!("https://{}{}", host, uri)).ok();
+        let is_metadata = parsed_url
+            .as_ref()
+            .map_or(false, |u| registry.is_metadata_url(u));
+
+        debug!(
+            "request {} is_metadata={} rule={}",
+            uri,
+            is_metadata,
+            rule.is_some()
+        );
+
+        let mut req = req;
+
+        if is_metadata {
+            registry.modify_request_headers(req.headers_mut());
+            req.headers_mut().remove("accept-encoding");
+        }
 
         Box::pin(async move {
-            stats.lock().unwrap().requests_inspected += 1;
+            stats.lock().unwrap().packages_checked += 1;
+
             let resp = forward_https(&host, port, req).await?;
-            Ok(resp)
+
+            if !is_metadata || rule.is_none() {
+                return Ok(resp);
+            }
+
+            let rule = rule.unwrap();
+            let (mut parts, body) = resp.into_parts();
+            let bytes = collect_body(body).await?;
+
+            let content_encoding = parts
+                .headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("none");
+            let content_type = parts
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("none");
+            debug!(
+                "response: {} bytes, encoding={}, type={}",
+                bytes.len(),
+                content_encoding,
+                content_type
+            );
+
+            if content_encoding != "none" && content_encoding != "identity" {
+                debug!("compressed response, cannot rewrite");
+                return Ok(hyper::Response::from_parts(
+                    parts,
+                    full_body(bytes.to_vec()),
+                ));
+            }
+
+            let quarantined: Arc<Mutex<Vec<QuarantinedVersion>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let quarantined_capture = quarantined.clone();
+            let pkg_name = {
+                let path = uri.trim_start_matches('/');
+                path.split('/').next_back().unwrap_or(path).to_string()
+            };
+            let check = move |info: &VersionInfo| {
+                let verdict = rule.check(info);
+                if matches!(verdict, RuleVerdict::StripVersion) {
+                    quarantined_capture.lock().unwrap().push(QuarantinedVersion {
+                        version: info.version.clone(),
+                        published_at: info.published_at,
+                    });
+                }
+                verdict
+            };
+
+            let rewritten = registry.modify_metadata_response(&bytes, &parts.headers, &check);
+            let rewrite_desc = rewritten.as_ref().map_or("unchanged".to_string(), |b| {
+                format!("{} bytes rewritten", b.len())
+            });
+            debug!(
+                "metadata rewrite: {} bytes -> {}",
+                bytes.len(),
+                rewrite_desc
+            );
+
+            if let Some(new_body) = rewritten {
+                let versions = std::mem::take(&mut *quarantined.lock().unwrap());
+                if !versions.is_empty() {
+                    stats.lock().unwrap().packages_quarantined.push(
+                        QuarantinedPackage {
+                            name: pkg_name,
+                            quarantined_versions: versions,
+                        },
+                    );
+                }
+                parts.headers.insert(
+                    "content-length",
+                    new_body.len().to_string().parse().unwrap(),
+                );
+                parts.headers.remove("content-encoding");
+                return Ok(hyper::Response::from_parts(parts, full_body(new_body)));
+            }
+
+            Ok(hyper::Response::from_parts(
+                parts,
+                full_body(bytes.to_vec()),
+            ))
         })
     }
+}
+
+async fn collect_body(
+    body: http_body_util::combinators::BoxBody<Bytes, String>,
+) -> anyhow::Result<Vec<u8>> {
+    let collected = body
+        .collect()
+        .await
+        .map_err(|e| anyhow::anyhow!("body collect: {e}"))?;
+    Ok(collected.to_bytes().to_vec())
+}
+
+fn full_body(data: Vec<u8>) -> http_body_util::combinators::BoxBody<Bytes, String> {
+    http_body_util::Full::new(Bytes::from(data))
+        .map_err(|_| String::new())
+        .boxed()
 }
 
 async fn forward_https(
@@ -248,13 +387,11 @@ async fn forward_https(
     port: u16,
     req: hyper::Request<Incoming>,
 ) -> anyhow::Result<hyper::Response<http_body_util::combinators::BoxBody<Bytes, String>>> {
-    let target_url = format!("https://{}{}", host, req.uri());
-    let uri: hyper::Uri = target_url.parse()?;
-
     let mut builder = hyper::Request::builder()
         .method(req.method().clone())
-        .uri(&uri)
-        .version(req.version());
+        .uri(req.uri())
+        .version(req.version())
+        .header("host", host);
 
     for (name, value) in req.headers() {
         if name == "host" {
@@ -292,18 +429,13 @@ async fn forward_https(
 
 fn root_store() -> Arc<rustls::RootCertStore> {
     let mut store = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs()
-        .expect("load native certs")
-    {
+    for cert in rustls_native_certs::load_native_certs().expect("load native certs") {
         store.add(cert).ok();
     }
     Arc::new(store)
 }
 
-async fn handle_http(
-    mut reader: BufReader<TcpStream>,
-    first_line: Vec<u8>,
-) -> anyhow::Result<()> {
+async fn handle_http(mut reader: BufReader<TcpStream>, first_line: Vec<u8>) -> anyhow::Result<()> {
     let mut headers_buf = first_line;
     loop {
         let mut line = Vec::new();

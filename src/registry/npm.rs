@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use http::HeaderMap;
 use jiff::Timestamp;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use url::Url;
 
 use super::{PackageRef, Registry, VersionInfo};
@@ -9,6 +12,17 @@ use crate::rule::RuleVerdict;
 pub struct NpmRegistry;
 
 const KNOWN_HOSTS: &[&str] = &["registry.npmjs.org", "registry.yarnpkg.com"];
+
+#[derive(Deserialize, Serialize)]
+struct NpmMetadata {
+    name: String,
+    #[serde(rename = "dist-tags")]
+    dist_tags: BTreeMap<String, String>,
+    time: BTreeMap<String, String>,
+    versions: Map<String, serde_json::Value>,
+    #[serde(flatten)]
+    extra: Map<String, serde_json::Value>,
+}
 
 impl Registry for NpmRegistry {
     fn known_hosts(&self) -> &[&str] {
@@ -53,15 +67,7 @@ impl Registry for NpmRegistry {
     }
 
     fn modify_request_headers(&self, headers: &mut HeaderMap) {
-        if let Some(accept) = headers.get("accept") {
-            if accept
-                .to_str()
-                .unwrap_or("")
-                .contains("application/vnd.npm.install-v1+json")
-            {
-                headers.insert("accept", "application/json".parse().unwrap());
-            }
-        }
+        headers.insert("accept", "application/json".parse().unwrap());
     }
 
     fn modify_metadata_response(
@@ -70,81 +76,103 @@ impl Registry for NpmRegistry {
         headers: &HeaderMap,
         check_version: &dyn Fn(&VersionInfo) -> RuleVerdict,
     ) -> Option<Vec<u8>> {
-        let mut json: Value = serde_json::from_slice(body).ok()?;
-        let time_map = json.get("time")?.as_object()?.clone();
-        let name = json.get("name")?.as_str()?.to_string();
+        let mut meta: NpmMetadata = serde_json::from_slice(body).ok()?;
 
-        let mut modified = false;
-        let mut versions_to_remove = Vec::new();
-
-        for (version, ts_val) in &time_map {
+        let mut to_remove = Vec::new();
+        for (version, ts_str) in &meta.time {
             if version == "created" || version == "modified" {
                 continue;
             }
-            let ts_str = ts_val.as_str()?;
             let published_at: Option<Timestamp> = ts_str.parse().ok();
             let info = VersionInfo {
-                name: name.clone(),
+                name: meta.name.clone(),
                 version: version.clone(),
                 published_at,
                 ecosystem: super::Ecosystem::Javascript,
             };
             if let RuleVerdict::StripVersion = check_version(&info) {
-                versions_to_remove.push(version.clone());
-                modified = true;
+                to_remove.push(version.clone());
             }
         }
 
-        for version in &versions_to_remove {
-            if let Some(time) = json.get_mut("time").and_then(|t| t.as_object_mut()) {
-                time.remove(version);
-            }
-            if let Some(versions) = json.get_mut("versions").and_then(|v| v.as_object_mut()) {
-                versions.remove(version);
-            }
-            if let Some(tags) = json.get_mut("dist-tags").and_then(|t| t.as_object_mut()) {
-                tags.retain(|_, v| v.as_str().map_or(true, |tag_ver| tag_ver != version));
-            }
+        if to_remove.is_empty() {
+            return None;
         }
 
-        let had_latest = json
-            .get("dist-tags")
-            .and_then(|t| t.get("latest"))
-            .is_some();
-        if had_latest && json.get("dist-tags").and_then(|t| t.get("latest")).is_none() {
-            if let Some(latest) = recalculate_latest(&json) {
-                json["dist-tags"]["latest"] = Value::String(latest);
-            }
+        for v in &to_remove {
+            meta.time.remove(v);
+            meta.versions.remove(v);
+            meta.dist_tags.retain(|_, tag_ver| tag_ver != v);
         }
 
-        if modified {
-            clear_caching_headers(headers);
-            Some(serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec()))
-        } else {
-            None
+        if !meta.dist_tags.contains_key("latest")
+            && let Some(latest) = recalculate_latest(&meta.time)
+        {
+            meta.dist_tags.insert("latest".into(), latest);
         }
+
+        clear_caching_headers(headers);
+        Some(serde_json::to_vec(&meta).unwrap_or_else(|_| body.to_vec()))
     }
 }
 
-fn recalculate_latest(json: &Value) -> Option<String> {
-    let time = json.get("time")?.as_object()?;
-    let mut best: Option<(String, String)> = None;
-    for (ver, ts) in time {
-        if ver == "created" || ver == "modified" || ver.contains('-') {
-            continue;
-        }
-        let ts_str = ts.as_str()?;
-        if best
-            .as_ref()
-            .map_or(true, |(_, best_ts)| ts_str > best_ts.as_str())
-        {
-            best = Some((ver.clone(), ts_str.to_string()));
-        }
-    }
-    best.map(|(v, _)| v)
+fn recalculate_latest(time: &BTreeMap<String, String>) -> Option<String> {
+    time.iter()
+        .filter(|(ver, _)| *ver != "created" && *ver != "modified" && !ver.contains('-'))
+        .max_by_key(|(_, ts)| ts.as_str())
+        .map(|(ver, _)| ver.clone())
 }
 
 fn clear_caching_headers(headers: &HeaderMap) {
-    // TODO: remove etag, last-modified, content-length when rewriting response
     let _ = headers;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rule::MinimumAge;
+
+    fn load_fixture() -> Vec<u8> {
+        std::fs::read("tests/data/npmjs/express.json").expect("fixture missing")
+    }
+
+    #[test]
+    fn npm_rewrite_against_real_metadata() {
+        let body = load_fixture();
+        let headers = HeaderMap::new();
+        let rule = MinimumAge::new(jiff::Span::new().hours(365 * 24));
+        let cutoff = rule.cutoff();
+
+        let result =
+            NpmRegistry.modify_metadata_response(&body, &headers, &|info| rule.check(info));
+
+        assert!(
+            result.is_some(),
+            "should rewrite — there are versions newer than 1 year"
+        );
+        let meta: NpmMetadata = serde_json::from_slice(result.as_ref().unwrap()).unwrap();
+
+        for (version, ts_str) in &meta.time {
+            if version == "created" || version == "modified" {
+                continue;
+            }
+            let ts: Timestamp = ts_str.parse().unwrap();
+            assert!(
+                ts <= cutoff,
+                "remaining version {version} ({ts}) is newer than cutoff ({cutoff})"
+            );
+        }
+
+        let original: NpmMetadata = serde_json::from_slice(&body).unwrap();
+        assert!(
+            meta.versions.len() < original.versions.len(),
+            "should have stripped some versions ({} vs {})",
+            meta.versions.len(),
+            original.versions.len(),
+        );
+        assert!(
+            meta.extra.contains_key("readme"),
+            "extra fields like 'readme' should be preserved through round-trip"
+        );
+    }
 }

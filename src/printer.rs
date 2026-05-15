@@ -3,7 +3,7 @@ use rich_rust::markup;
 use rich_rust::prelude::*;
 use rich_rust::renderables::PaddingDimensions;
 
-use crate::proxy::ProxyStats;
+use crate::proxy::{ProxyStats, QuarantinedVersion};
 use crate::registry::Ecosystem;
 
 pub struct Printer {
@@ -39,21 +39,26 @@ impl Printer {
         let mut lines = Vec::new();
 
         lines.push(format!(
-            "[bold]{}[/] connections intercepted",
-            stats.connections_intercepted
-        ));
-        lines.push(format!(
-            "[bold]{}[/] requests inspected",
-            stats.requests_inspected
+            "[bold]{}[/] {} checked",
+            stats.packages_checked,
+            if stats.packages_checked == 1 { "package" } else { "packages" },
         ));
 
-        if !stats.versions_suppressed.is_empty() {
+        if !stats.packages_quarantined.is_empty() {
+            let total_versions: usize = stats
+                .packages_quarantined
+                .iter()
+                .map(|p| p.quarantined_versions.len())
+                .sum();
             lines.push(format!(
-                "[bold yellow]{}[/] versions suppressed",
-                stats.versions_suppressed.len()
+                "[bold blue]{}[/] versions quarantined across [bold blue]{}[/] {}",
+                total_versions,
+                stats.packages_quarantined.len(),
+                if stats.packages_quarantined.len() == 1 { "package" } else { "packages" },
             ));
-            for item in &stats.versions_suppressed {
-                lines.push(format!("[dim]  {}@{}[/]", item.package, item.version));
+            for pkg in &stats.packages_quarantined {
+                let summary = format_quarantined_versions(&pkg.quarantined_versions);
+                lines.push(format!("[dim]  {} ({})[/]", pkg.name, summary));
             }
         }
 
@@ -78,8 +83,8 @@ impl Printer {
         let styled = markup::render_or_plain(&content);
         let border_color = if !stats.downloads_blocked.is_empty() {
             "red"
-        } else if !stats.versions_suppressed.is_empty() {
-            "yellow"
+        } else if !stats.packages_quarantined.is_empty() {
+            "blue"
         } else {
             "green"
         };
@@ -96,5 +101,17 @@ impl Printer {
             .padding(PaddingDimensions::symmetric(0, 2));
         self.console.print_renderable(&panel);
         self.console.line();
+    }
+}
+
+fn format_quarantined_versions(versions: &[QuarantinedVersion]) -> String {
+    let mut sorted: Vec<&QuarantinedVersion> = versions.iter().collect();
+    sorted.sort_by_key(|v| &v.version);
+    let max_show = 3;
+    if sorted.len() <= max_show {
+        sorted.iter().map(|v| v.version.as_str()).collect::<Vec<_>>().join(", ")
+    } else {
+        let shown: Vec<&str> = sorted.iter().take(max_show).map(|v| v.version.as_str()).collect();
+        format!("{}, and {} more", shown.join(", "), sorted.len() - max_show)
     }
 }

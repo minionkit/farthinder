@@ -23,3 +23,57 @@ You already know this is a risk. But the existing solutions do not fit how devel
 - **Zero-Infrastructure Configuration**: No proxies, custom artifact endpoints, or enterprise accounts to set up. It protects your machine globally right out of the box, while respecting standard, layered configuration files for any project-specific overrides.
 
 ## See It In Action
+
+```console
+$ fart --install 
+- created shims for 6 supported tools:
+    npm, bun, uv, python, pip
+- installed CA root certificate
+- pre-fetching vulnerability databases...
+- DONE
+
+$ cd ~/some-project
+
+$ bun install
+╭─ Farthinder ────────────────────────────────────────────╮
+│ Watching npm traffic                                     │
+╰─────────────────────────────────────────────────────────╯
+
+bun install v1.3.11 (af24e281)
+ + typescript@6.0.3
+ 1 package installed [1027.00ms]
+
+╭─ Farthinder Summary ───────────────────────────────────╮
+│ 8 packages checked                                       │
+│ 2 versions quarantined across 2 packages                 │
+│   lodash (4.18.1), typescript (6.0.4)                   │
+╰─────────────────────────────────────────────────────────╯
+```
+
+## Safety nets
+
+### By ecosystem
+
+| | JS | Python | Rust | Elixir | Java |
+|---|---|---|---|---|---|
+| Time-delay quarantine (48h) | ✅ | ✅ | 🔧 | 🔧 | 🔧 |
+| Vulnerability database checks | 🔧 | 🔧 | 🔧 | 🔧 | 🔧 |
+| Block exotic transitive sources | 🔧 | 🔧 | 🔧 | 🔧 | 🔧 |
+| Block postinstall scripts | 🔧 | — | — | — | — |
+| Trust policy (no-downgrade) | 🔧 | 🔧 | 🔧 | 🔧 | 🔧 |
+
+### By platform
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Network interception (MITM proxy) | ✅ | 🔧 | 🔧 |
+| Kernel sandbox | 🔧 | 🔧 | 🔧 |
+| Sensitive file read protection | 🔧 | 🔧 | 🔧 |
+| File write restriction | 🔧 | 🔧 | 🔧 |
+| Execution allowlist | 🔧 | 🔧 | 🔧 |
+| Privilege escalation blocking | 🔧 | 🔧 | 🔧 |
+| Symlink attack prevention | 🔧 | 🔧 | — |
+| Clipboard/screen exfiltration blocking | 🔧 | 🔧 | 🔧 |
+| seccomp syscall filtering | — | 🔧 | — |
+
+✅ implemented · 🔧 planned

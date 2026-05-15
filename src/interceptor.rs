@@ -8,9 +8,11 @@ use std::{
 use anyhow::Context;
 use tracing::debug;
 
+use crate::config;
 use crate::printer::Printer;
 use crate::proxy::ProxyServer;
 use crate::registry::Ecosystem;
+use crate::rule::MinimumAge;
 
 pub struct Interceptor {
     target: PathBuf,
@@ -48,7 +50,12 @@ impl Interceptor {
             return cmd.status().context("execute command");
         };
 
-        let proxy = ProxyServer::spawn(Some(*ecosystem)).await?;
+        let cfg = config::load().unwrap_or_default();
+        debug!("config: min_age_hours={}", cfg.min_age_hours);
+        let rule = Some(MinimumAge::new(
+            jiff::Span::new().hours(cfg.min_age_hours as i64),
+        ));
+        let proxy = ProxyServer::spawn(Some(*ecosystem), rule).await?;
         let printer = Printer::new();
 
         printer.banner(*ecosystem);

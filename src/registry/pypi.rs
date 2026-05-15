@@ -192,10 +192,7 @@ fn modify_json_response(
 
     if let Some(files) = json.get_mut("files").and_then(|f| f.as_array_mut()) {
         files.retain(|entry| {
-            let filename = entry
-                .get("filename")
-                .and_then(|f| f.as_str())
-                .unwrap_or("");
+            let filename = entry.get("filename").and_then(|f| f.as_str()).unwrap_or("");
             let fake_url = format!("https://files.pythonhosted.org/packages/{}", filename);
             if let Ok(url) = Url::parse(&fake_url) {
                 if let Some(pkg) = PyPIRegistry.parse_package_from_url(&url) {

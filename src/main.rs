@@ -1,4 +1,5 @@
 mod cert;
+mod config;
 mod interceptor;
 mod printer;
 mod proxy;
@@ -24,7 +25,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let exe_name = current_exe_name()?;
+    tracing::info!("farthinder starting, exe={}", exe_name);
 
     if exe_name == "fart" {
         let cli = Cli::parse();
