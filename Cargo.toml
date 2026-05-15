@@ -17,6 +17,7 @@ hyper = "1.9.0"
 hyper-util = { version = "0.1.20", features = ["client", "client-proxy", "http1", "server", "tokio"] }
 jiff = "0.2.24"
 rcgen = "0.14.8"
+rich_rust = "0.2.1"
 rustls = { version = "0.23.40", features = ["aws_lc_rs", "tls12"] }
 rustls-native-certs = "0.8.3"
 rustls-pemfile = "2.2.0"
@@ -26,6 +27,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
 tokio-rustls = "0.26.4"
 tracing = "0.1.44"
+url = "2.5.8"
 
 [dev-dependencies]
 insta = "1.47.2"
