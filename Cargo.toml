@@ -1,0 +1,11 @@
+[package]
+name = "farthinder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+hyper = "1.9.0"
+rcgen = "0.14.8"
+strum = { version = "0.28.0", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread"] }
