@@ -3,6 +3,7 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -11,8 +12,9 @@ use tracing::debug;
 use crate::config;
 use crate::printer::Printer;
 use crate::proxy::ProxyServer;
-use crate::registry::Ecosystem;
-use crate::rule::MinimumAge;
+use crate::registry::{Ecosystem, Registry};
+use crate::rule::Rules;
+use crate::sandbox::{self, SandboxPolicy, WrappedCommand};
 
 pub struct Interceptor {
     target: PathBuf,
@@ -43,53 +45,97 @@ impl Interceptor {
     }
 
     pub async fn run(&self) -> anyhow::Result<ExitStatus> {
-        let mut cmd = Command::new(&self.target);
-        cmd.arg0(&self.arg0).args(env::args().skip(1));
-
         let Some(ecosystem) = &self.ecosystem else {
+            let mut cmd = Command::new(&self.target);
+            cmd.arg0(&self.arg0).args(env::args().skip(1));
             return cmd.status().context("execute command");
         };
 
         let cfg = config::load().unwrap_or_default();
-        debug!("config: min_age_hours={}", cfg.min_age_hours);
-        let rule = Some(MinimumAge::new(
-            jiff::Span::new().hours(cfg.min_age_hours as i64),
-        ));
-        let proxy = ProxyServer::spawn(Some(*ecosystem), rule).await?;
+        debug!("config: min_age_hours={}, sandbox_required={}", cfg.min_age_hours, cfg.sandbox_required);
+
+        let rules = Rules::new(cfg.min_age_hours);
+        let registry: Arc<dyn Registry> = Arc::from(ecosystem.registry(rules));
+        let proxy = ProxyServer::spawn(registry.clone()).await?;
         let printer = Printer::new();
 
         printer.banner(*ecosystem);
 
         let ca_cert_path = write_ca_cert_temp(&proxy.ca_cert_pem)?;
+        let proxy_port = proxy.port();
 
-        match ecosystem {
-            Ecosystem::Javascript => {
-                cmd.env("npm_config_proxy", &proxy.url)
-                    .env("npm_config_https_proxy", &proxy.url)
-                    .env("HTTP_PROXY", &proxy.url)
-                    .env("HTTPS_PROXY", &proxy.url)
-                    .env(
-                        "NODE_EXTRA_CA_CERTS",
-                        ca_cert_path.to_string_lossy().as_ref(),
-                    );
-            }
-            Ecosystem::Python => {
-                cmd.env("HTTP_PROXY", &proxy.url)
-                    .env("HTTPS_PROXY", &proxy.url)
-                    .env("http_proxy", &proxy.url)
-                    .env("https_proxy", &proxy.url)
-                    .env(
-                        "REQUESTS_CA_BUNDLE",
-                        ca_cert_path.to_string_lossy().as_ref(),
-                    )
-                    .env("SSL_CERT_FILE", ca_cert_path.to_string_lossy().as_ref())
-                    .env("PIP_CERT", ca_cert_path.to_string_lossy().as_ref());
-            }
+        let mut env_vars = match ecosystem {
+            Ecosystem::Javascript => vec![
+                ("npm_config_proxy".to_string(), proxy.url.clone()),
+                ("npm_config_https_proxy".to_string(), proxy.url.clone()),
+                ("HTTP_PROXY".to_string(), proxy.url.clone()),
+                ("HTTPS_PROXY".to_string(), proxy.url.clone()),
+                (
+                    "NODE_EXTRA_CA_CERTS".to_string(),
+                    ca_cert_path.to_string_lossy().to_string(),
+                ),
+            ],
+            Ecosystem::Python => vec![
+                ("HTTP_PROXY".to_string(), proxy.url.clone()),
+                ("HTTPS_PROXY".to_string(), proxy.url.clone()),
+                ("http_proxy".to_string(), proxy.url.clone()),
+                ("https_proxy".to_string(), proxy.url.clone()),
+                (
+                    "REQUESTS_CA_BUNDLE".to_string(),
+                    ca_cert_path.to_string_lossy().to_string(),
+                ),
+                (
+                    "SSL_CERT_FILE".to_string(),
+                    ca_cert_path.to_string_lossy().to_string(),
+                ),
+                (
+                    "PIP_CERT".to_string(),
+                    ca_cert_path.to_string_lossy().to_string(),
+                ),
+            ],
+        };
+
+        let enforcer = sandbox::get_enforcer();
+        if cfg.sandbox_required && enforcer.is_none() {
+            anyhow::bail!(
+                "sandbox is required but no kernel enforcer is available on this platform"
+            );
         }
 
-        debug!("executing {:?}", cmd.get_envs());
-        let status = cmd.status().context("execute command");
-        let stats = proxy.stats();
+        let status = if let Some(enforcer) = &enforcer {
+            let policy = SandboxPolicy {
+                proxy_port,
+                deny_read_paths: sandbox::deny_read_paths(),
+            };
+
+            let wrapped = WrappedCommand {
+                program: self.target.to_string_lossy().to_string(),
+                args: env::args().skip(1).collect(),
+                env: env_vars.clone(),
+            };
+
+            let sandboxed = enforcer.wrap_command(&policy, &wrapped)?;
+            env_vars = sandboxed.env;
+
+            let mut cmd = Command::new(&sandboxed.program);
+            cmd.arg0(&self.arg0).args(&sandboxed.args);
+            for (k, v) in &env_vars {
+                cmd.env(k, v);
+            }
+            debug!("executing sandboxed {:?}", cmd.get_program());
+            cmd.status().context("execute sandboxed command")
+        } else {
+            let mut cmd = Command::new(&self.target);
+            cmd.arg0(&self.arg0).args(env::args().skip(1));
+            for (k, v) in &env_vars {
+                cmd.env(k, v);
+            }
+            debug!("executing unsandboxed");
+            cmd.status().context("execute command")
+        };
+
+        let mut stats = registry.stats();
+        stats.connections_tunneled = proxy.tunneled();
         proxy.shutdown();
         let _ = std::fs::remove_file(&ca_cert_path);
 

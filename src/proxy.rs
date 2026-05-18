@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    Mutex,
+};
 
 use anyhow::Context;
 use http_body_util::BodyExt;
@@ -11,53 +15,17 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::cert::CaState;
-use crate::registry::{Ecosystem, Registry, VersionInfo};
-use crate::rule::{MinimumAge, RuleVerdict};
-
-#[derive(Debug, Clone, Default)]
-pub struct ProxyStats {
-    pub connections_tunneled: usize,
-    pub packages_checked: usize,
-    pub packages_quarantined: Vec<QuarantinedPackage>,
-    pub downloads_blocked: Vec<BlockedItem>,
-}
-
-#[derive(Debug, Clone)]
-pub struct QuarantinedPackage {
-    pub name: String,
-    pub quarantined_versions: Vec<QuarantinedVersion>,
-}
-
-#[derive(Debug, Clone)]
-pub struct QuarantinedVersion {
-    pub version: String,
-    pub published_at: Option<jiff::Timestamp>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BlockedItem {
-    pub package: String,
-    pub version: String,
-}
-
-impl ProxyStats {
-    pub fn active(&self) -> bool {
-        self.packages_checked > 0 || self.connections_tunneled > 0
-    }
-}
+use crate::registry::{Registry, ResponseAction};
 
 pub struct ProxyServer {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     pub url: String,
     pub ca_cert_pem: String,
-    stats: Arc<Mutex<ProxyStats>>,
+    tunneled: Arc<AtomicUsize>,
 }
 
 impl ProxyServer {
-    pub async fn spawn(
-        ecosystem: Option<Ecosystem>,
-        rule: Option<MinimumAge>,
-    ) -> anyhow::Result<Self> {
+    pub async fn spawn(registry: Arc<dyn Registry>) -> anyhow::Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .context("bind proxy port")?;
@@ -67,24 +35,22 @@ impl ProxyServer {
 
         let ca_state = Arc::new(Mutex::new(CaState::new()?));
         let ca_cert_pem = ca_state.lock().unwrap().ca_cert_pem().to_string();
+        let tunneled = Arc::new(AtomicUsize::new(0));
 
-        let stats = Arc::new(Mutex::new(ProxyStats::default()));
+        let core = ProxyCore {
+            registry,
+            ca_state,
+            tunneled: tunneled.clone(),
+        };
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(run(
-            listener,
-            ecosystem,
-            ca_state,
-            stats.clone(),
-            rule,
-            shutdown_rx,
-        ));
+        tokio::spawn(core.accept_loop(listener, shutdown_rx));
 
         Ok(ProxyServer {
             shutdown_tx,
             url: proxy_url,
             ca_cert_pem,
-            stats,
+            tunneled,
         })
     }
 
@@ -92,155 +58,137 @@ impl ProxyServer {
         let _ = self.shutdown_tx.send(());
     }
 
-    pub fn stats(&self) -> ProxyStats {
-        self.stats.lock().unwrap().clone()
+    pub fn port(&self) -> u16 {
+        self.url
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    pub fn tunneled(&self) -> usize {
+        self.tunneled.load(Ordering::Relaxed)
     }
 }
 
-async fn run(
-    listener: tokio::net::TcpListener,
-    ecosystem: Option<Ecosystem>,
+struct ProxyCore {
+    registry: Arc<dyn Registry>,
     ca_state: Arc<Mutex<CaState>>,
-    stats: Arc<Mutex<ProxyStats>>,
-    rule: Option<MinimumAge>,
-    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-) -> anyhow::Result<()> {
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (stream, addr) = accept_result?;
-                debug!("accepted {}", addr);
-                let ec = ecosystem;
-                let ca = ca_state.clone();
-                let st = stats.clone();
-                let r = rule;
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, ec, ca, st, r).await {
-                        warn!("connection error: {:#}", e);
-                    }
-                });
+    tunneled: Arc<AtomicUsize>,
+}
+
+impl ProxyCore {
+    async fn accept_loop(
+        self,
+        listener: tokio::net::TcpListener,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, addr) = accept_result?;
+                    debug!("accepted {}", addr);
+                    let core = self.clone_core();
+                    tokio::spawn(async move {
+                        if let Err(e) = core.handle_connection(stream).await {
+                            warn!("connection error: {:#}", e);
+                        }
+                    });
+                }
+                _ = &mut shutdown_rx => return Ok(()),
             }
-            _ = &mut shutdown_rx => return Ok(()),
         }
     }
-}
 
-async fn handle_connection(
-    stream: TcpStream,
-    ecosystem: Option<Ecosystem>,
-    ca_state: Arc<Mutex<CaState>>,
-    stats: Arc<Mutex<ProxyStats>>,
-    rule: Option<MinimumAge>,
-) -> anyhow::Result<()> {
-    let mut reader = BufReader::new(stream);
-    let mut first_line = Vec::new();
-    reader.read_until(b'\n', &mut first_line).await?;
-    let line = String::from_utf8_lossy(&first_line);
+    fn clone_core(&self) -> ProxyCore {
+        ProxyCore {
+            registry: self.registry.clone(),
+            ca_state: self.ca_state.clone(),
+            tunneled: self.tunneled.clone(),
+        }
+    }
 
-    if line.starts_with("CONNECT ") {
-        let host_port = parse_connect_host(&line)?;
-        let stream = reader.into_inner();
-        handle_connect(stream, &host_port, ecosystem, ca_state, stats, rule).await
-    } else {
-        handle_http(reader, first_line).await
+    async fn handle_connection(&self, stream: TcpStream) -> anyhow::Result<()> {
+        let mut reader = BufReader::new(stream);
+        let mut first_line = Vec::new();
+        reader.read_until(b'\n', &mut first_line).await?;
+        let line = String::from_utf8_lossy(&first_line);
+
+        if line.starts_with("CONNECT ") {
+            let host_port = parse_connect_host(&line)?;
+            let stream = reader.into_inner();
+            self.handle_connect(stream, &host_port).await
+        } else {
+            handle_http(reader, first_line).await
+        }
+    }
+
+    async fn handle_connect(&self, client: TcpStream, host_port: &str) -> anyhow::Result<()> {
+        let (host, port) = parse_host_port(host_port);
+        debug!("CONNECT {}:{}", host, port);
+
+        let is_registry_host = self.registry.known_hosts().iter().any(|h| host == *h);
+        if is_registry_host {
+            self.handle_mitm(client, host, port).await
+        } else {
+            self.tunneled.fetch_add(1, Ordering::Relaxed);
+            self.handle_tunnel(client, &host, port).await
+        }
+    }
+
+    async fn handle_tunnel(&self, mut client: TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+        let mut target = TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("connect to {}:{}", host, port))?;
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+
+        let (mut cr, mut cw) = client.split();
+        let (mut tr, mut tw) = target.split();
+        tokio::select! {
+            r = tokio::io::copy(&mut cr, &mut tw) => r?,
+            r = tokio::io::copy(&mut tr, &mut cw) => r?,
+        };
+        Ok(())
+    }
+
+    async fn handle_mitm(
+        &self,
+        mut client: TcpStream,
+        host: String,
+        port: u16,
+    ) -> anyhow::Result<()> {
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+
+        let acceptor = self.ca_state.lock().unwrap().tls_acceptor_for_host(&host)?;
+        let tls_stream = acceptor.accept(client).await?;
+        let io = TokioIo::new(tls_stream);
+
+        let upstream = UpstreamForwarder { host: host.clone(), port };
+        let svc = RegistryMiddleware {
+            inner: upstream,
+            registry: self.registry.clone(),
+            mitm_host: host,
+        };
+
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, svc)
+            .await?;
+
+        Ok(())
     }
 }
 
-fn parse_connect_host(line: &str) -> anyhow::Result<String> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 {
-        anyhow::bail!("invalid CONNECT request");
-    }
-    Ok(parts[1].to_string())
-}
-
-fn parse_host_port(host_port: &str) -> (String, u16) {
-    let mut parts = host_port.splitn(2, ':');
-    let host = parts.next().unwrap_or("localhost").to_string();
-    let port: u16 = parts.next().unwrap_or("443").parse().unwrap_or(443);
-    (host, port)
-}
-
-async fn handle_connect(
-    client: TcpStream,
-    host_port: &str,
-    ecosystem: Option<Ecosystem>,
-    ca_state: Arc<Mutex<CaState>>,
-    stats: Arc<Mutex<ProxyStats>>,
-    rule: Option<MinimumAge>,
-) -> anyhow::Result<()> {
-    let (host, port) = parse_host_port(host_port);
-    debug!("CONNECT {}:{} (ecosystem={:?})", host, port, ecosystem);
-
-    if let Some(ec) = ecosystem
-        && ec.matches_host(&host)
-    {
-        return handle_mitm(client, host, port, ec, ca_state, stats, rule).await;
-    }
-
-    stats.lock().unwrap().connections_tunneled += 1;
-    handle_tunnel(client, &host, port).await
-}
-
-async fn handle_tunnel(mut client: TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
-    let mut target = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("connect to {}:{}", host, port))?;
-    client
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-
-    let (mut cr, mut cw) = client.split();
-    let (mut tr, mut tw) = target.split();
-    tokio::select! {
-        r = tokio::io::copy(&mut cr, &mut tw) => r?,
-        r = tokio::io::copy(&mut tr, &mut cw) => r?,
-    };
-    Ok(())
-}
-
-async fn handle_mitm(
-    mut client: TcpStream,
+#[derive(Clone)]
+struct UpstreamForwarder {
     host: String,
     port: u16,
-    ecosystem: Ecosystem,
-    ca_state: Arc<Mutex<CaState>>,
-    stats: Arc<Mutex<ProxyStats>>,
-    rule: Option<MinimumAge>,
-) -> anyhow::Result<()> {
-    client
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-
-    let acceptor = ca_state.lock().unwrap().tls_acceptor_for_host(&host)?;
-    let tls_stream = acceptor.accept(client).await?;
-
-    let io = TokioIo::new(tls_stream);
-    let registry: Arc<dyn Registry> = Arc::from(ecosystem.registry());
-    let svc = MitmService {
-        host,
-        port,
-        registry,
-        stats,
-        rule,
-    };
-
-    hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, svc)
-        .await?;
-
-    Ok(())
 }
 
-struct MitmService {
-    host: String,
-    port: u16,
-    registry: Arc<dyn Registry>,
-    stats: Arc<Mutex<ProxyStats>>,
-    rule: Option<MinimumAge>,
-}
-
-impl hyper::service::Service<hyper::Request<Incoming>> for MitmService {
+impl hyper::service::Service<hyper::Request<Incoming>> for UpstreamForwarder {
     type Response = hyper::Response<http_body_util::combinators::BoxBody<Bytes, String>>;
     type Error = anyhow::Error;
     type Future = std::pin::Pin<
@@ -250,118 +198,66 @@ impl hyper::service::Service<hyper::Request<Incoming>> for MitmService {
     fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
         let host = self.host.clone();
         let port = self.port;
-        let stats = self.stats.clone();
+        Box::pin(async move { forward_https(&host, port, req).await })
+    }
+}
+
+#[derive(Clone)]
+struct RegistryMiddleware {
+    inner: UpstreamForwarder,
+    registry: Arc<dyn Registry>,
+    mitm_host: String,
+}
+
+impl hyper::service::Service<hyper::Request<Incoming>> for RegistryMiddleware {
+    type Response = hyper::Response<http_body_util::combinators::BoxBody<Bytes, String>>;
+    type Error = anyhow::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
+        let inner = self.inner.clone();
         let registry = self.registry.clone();
-        let rule = self.rule;
-
-        let uri = req.uri().to_string();
-        let parsed_url = Url::parse(&format!("https://{}{}", host, uri)).ok();
-        let is_metadata = parsed_url
-            .as_ref()
-            .map_or(false, |u| registry.is_metadata_url(u));
-
-        debug!(
-            "request {} is_metadata={} rule={}",
-            uri,
-            is_metadata,
-            rule.is_some()
-        );
-
-        let mut req = req;
-
-        if is_metadata {
-            registry.modify_request_headers(req.headers_mut());
-            req.headers_mut().remove("accept-encoding");
-        }
+        let host = self.mitm_host.clone();
 
         Box::pin(async move {
-            stats.lock().unwrap().packages_checked += 1;
+            let url = Url::parse(&format!("https://{}{}", host, req.uri())).ok();
 
-            let resp = forward_https(&host, port, req).await?;
-
-            if !is_metadata || rule.is_none() {
-                return Ok(resp);
+            let mut req = req;
+            if let Some(url) = &url {
+                registry.prepare_request(url, req.headers_mut());
             }
 
-            let rule = rule.unwrap();
+            let resp = inner.call(req).await?;
             let (mut parts, body) = resp.into_parts();
             let bytes = collect_body(body).await?;
 
-            let content_encoding = parts
-                .headers
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("none");
-            let content_type = parts
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("none");
-            debug!(
-                "response: {} bytes, encoding={}, type={}",
-                bytes.len(),
-                content_encoding,
-                content_type
-            );
-
-            if content_encoding != "none" && content_encoding != "identity" {
-                debug!("compressed response, cannot rewrite");
-                return Ok(hyper::Response::from_parts(
-                    parts,
-                    full_body(bytes.to_vec()),
-                ));
-            }
-
-            let quarantined: Arc<Mutex<Vec<QuarantinedVersion>>> =
-                Arc::new(Mutex::new(Vec::new()));
-            let quarantined_capture = quarantined.clone();
-            let pkg_name = {
-                let path = uri.trim_start_matches('/');
-                path.split('/').next_back().unwrap_or(path).to_string()
+            let action = match &url {
+                Some(url) => registry.handle_response(url, parts.status.as_u16(), &parts.headers, &bytes),
+                None => ResponseAction::Passthrough,
             };
-            let check = move |info: &VersionInfo| {
-                let verdict = rule.check(info);
-                if matches!(verdict, RuleVerdict::StripVersion) {
-                    quarantined_capture.lock().unwrap().push(QuarantinedVersion {
-                        version: info.version.clone(),
-                        published_at: info.published_at,
-                    });
+
+            match action {
+                ResponseAction::Passthrough => {
+                    Ok(hyper::Response::from_parts(parts, full_body(bytes)))
                 }
-                verdict
-            };
-
-            let rewritten = registry.modify_metadata_response(&bytes, &parts.headers, &check);
-            let rewrite_desc = rewritten.as_ref().map_or("unchanged".to_string(), |b| {
-                format!("{} bytes rewritten", b.len())
-            });
-            debug!(
-                "metadata rewrite: {} bytes -> {}",
-                bytes.len(),
-                rewrite_desc
-            );
-
-            if let Some(new_body) = rewritten {
-                let versions = std::mem::take(&mut *quarantined.lock().unwrap());
-                if !versions.is_empty() {
-                    stats.lock().unwrap().packages_quarantined.push(
-                        QuarantinedPackage {
-                            name: pkg_name,
-                            quarantined_versions: versions,
-                        },
+                ResponseAction::Rewrite { body: new_body } => {
+                    parts.headers.insert(
+                        "content-length",
+                        new_body.len().to_string().parse().unwrap(),
                     );
+                    parts.headers.remove("content-encoding");
+                    Ok(hyper::Response::from_parts(parts, full_body(new_body)))
                 }
-                parts.headers.insert(
-                    "content-length",
-                    new_body.len().to_string().parse().unwrap(),
-                );
-                parts.headers.remove("content-encoding");
-                return Ok(hyper::Response::from_parts(parts, full_body(new_body)));
+                ResponseAction::Block => {
+                    let resp = hyper::Response::builder()
+                        .status(403)
+                        .body(full_body(b"Forbidden".to_vec()))
+                        .unwrap();
+                    Ok(resp)
+                }
             }
-
-            Ok(hyper::Response::from_parts(
-                parts,
-                full_body(bytes.to_vec()),
-            ))
         })
     }
 }
@@ -433,6 +329,21 @@ fn root_store() -> Arc<rustls::RootCertStore> {
         store.add(cert).ok();
     }
     Arc::new(store)
+}
+
+fn parse_connect_host(line: &str) -> anyhow::Result<String> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        anyhow::bail!("invalid CONNECT request");
+    }
+    Ok(parts[1].to_string())
+}
+
+fn parse_host_port(host_port: &str) -> (String, u16) {
+    let mut parts = host_port.splitn(2, ':');
+    let host = parts.next().unwrap_or("localhost").to_string();
+    let port: u16 = parts.next().unwrap_or("443").parse().unwrap_or(443);
+    (host, port)
 }
 
 async fn handle_http(mut reader: BufReader<TcpStream>, first_line: Vec<u8>) -> anyhow::Result<()> {

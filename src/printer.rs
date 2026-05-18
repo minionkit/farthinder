@@ -3,8 +3,7 @@ use rich_rust::markup;
 use rich_rust::prelude::*;
 use rich_rust::renderables::PaddingDimensions;
 
-use crate::proxy::{ProxyStats, QuarantinedVersion};
-use crate::registry::Ecosystem;
+use crate::registry::{Ecosystem, QuarantinedVersion, RegistryStats};
 
 pub struct Printer {
     console: Console,
@@ -35,7 +34,7 @@ impl Printer {
         self.console.line();
     }
 
-    pub fn summary(&self, stats: &ProxyStats) {
+    pub fn summary(&self, stats: &RegistryStats) {
         let mut lines = Vec::new();
 
         lines.push(format!(

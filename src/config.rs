@@ -4,10 +4,16 @@ use serde::Deserialize;
 pub struct AppConfig {
     #[serde(default = "default_min_age_hours")]
     pub min_age_hours: u64,
+    #[serde(default = "default_true")]
+    pub sandbox_required: bool,
 }
 
 fn default_min_age_hours() -> u64 {
     48
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn load() -> anyhow::Result<AppConfig> {
@@ -27,6 +33,7 @@ pub fn load() -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
+#[allow(dead_code)]
 pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "farthinder")
         .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;

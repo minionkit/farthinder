@@ -1,3 +1,7 @@
+> [!WARNING]
+> This project is in its early Proof of Concept days! Expect rapid changes, missing pieces, and untested features.
+> We are still sorting out the official project license. For now, all rights and copyright are reserved.
+
 # Farthinder
 
 **Dev safely. Slow down before you bump your dependencies.**

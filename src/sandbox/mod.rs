@@ -1,0 +1,54 @@
+#[cfg(target_os = "macos")]
+mod macos;
+mod nop;
+
+use std::path::PathBuf;
+
+#[allow(unused_imports)]
+pub use nop::NopEnforcer;
+
+#[derive(Debug, Clone)]
+pub struct SandboxPolicy {
+    pub proxy_port: u16,
+    pub deny_read_paths: Vec<PathBuf>,
+}
+
+pub struct WrappedCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+pub trait SandboxEnforcer: Send + Sync {
+    fn wrap_command(&self, policy: &SandboxPolicy, cmd: &WrappedCommand) -> anyhow::Result<WrappedCommand>;
+}
+
+pub fn get_enforcer() -> Option<Box<dyn SandboxEnforcer>> {
+    #[cfg(target_os = "macos")]
+    {
+        if macos::MacosEnforcer::is_available() {
+            return Some(Box::new(macos::MacosEnforcer));
+        }
+    }
+    None
+}
+
+pub fn deny_read_paths() -> Vec<PathBuf> {
+    let home = directories::BaseDirs::new()
+        .map(|bd| bd.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()));
+    let mut paths = vec![
+        home.join(".ssh"),
+        home.join(".aws"),
+        home.join(".gnupg"),
+        home.join(".config").join("gcloud"),
+        home.join(".kube"),
+    ];
+    for name in &[".env", ".env.local", ".env.production", ".env.production.local"] {
+        let p = home.join(name);
+        if p.exists() {
+            paths.push(p);
+        }
+    }
+    paths
+}

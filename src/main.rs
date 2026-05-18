@@ -5,6 +5,7 @@ mod printer;
 mod proxy;
 mod registry;
 mod rule;
+mod sandbox;
 
 use std::{env, process};
 

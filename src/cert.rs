@@ -12,7 +12,6 @@ struct HostCert {
 
 pub struct CaState {
     ca_params: CertificateParams,
-    ca_cert: rcgen::Certificate,
     ca_key: KeyPair,
     ca_cert_pem: String,
     host_certs: HashMap<String, HostCert>,
@@ -30,7 +29,6 @@ impl CaState {
         let ca_cert_pem = ca_cert.pem();
         Ok(Self {
             ca_params: params,
-            ca_cert,
             ca_key,
             ca_cert_pem,
             host_certs: HashMap::new(),

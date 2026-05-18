@@ -1,17 +1,32 @@
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use http::HeaderMap;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
+use tracing::debug;
 use url::Url;
 
-use super::{PackageRef, Registry, VersionInfo};
-use crate::rule::RuleVerdict;
+use super::{QuarantinedPackage, QuarantinedVersion, Registry, RegistryStats, ResponseAction};
+use crate::rule::Rules;
 
-pub struct NpmRegistry;
+pub struct NpmRegistry {
+    cutoff: Timestamp,
+    state: Mutex<NpmState>,
+}
 
-const KNOWN_HOSTS: &[&str] = &["registry.npmjs.org", "registry.yarnpkg.com"];
+#[cfg(test)]
+impl NpmRegistry {
+    pub fn test_cutoff(&self) -> Timestamp {
+        self.cutoff
+    }
+}
+
+struct NpmState {
+    packages_checked: usize,
+    quarantined: Vec<QuarantinedPackage>,
+}
 
 #[derive(Deserialize, Serialize)]
 struct NpmMetadata {
@@ -24,9 +39,18 @@ struct NpmMetadata {
     extra: Map<String, serde_json::Value>,
 }
 
-impl Registry for NpmRegistry {
-    fn known_hosts(&self) -> &[&str] {
-        KNOWN_HOSTS
+const KNOWN_HOSTS: &[&str] = &["registry.npmjs.org", "registry.yarnpkg.com"];
+
+impl NpmRegistry {
+    pub fn new(rules: Rules) -> Self {
+        let cutoff = Timestamp::now() - jiff::Span::new().hours(rules.min_age_hours() as i64);
+        NpmRegistry {
+            cutoff,
+            state: Mutex::new(NpmState {
+                packages_checked: 0,
+                quarantined: Vec::new(),
+            }),
+        }
     }
 
     fn is_metadata_url(&self, url: &Url) -> bool {
@@ -34,69 +58,72 @@ impl Registry for NpmRegistry {
         !path.ends_with(".tgz") && !path.contains("/-/")
     }
 
-    fn parse_package_from_url(&self, url: &Url) -> Option<PackageRef> {
-        let path = url.path();
-        if !path.ends_with(".tgz") {
-            return None;
-        }
-        let host = url.host_str()?;
-        let prefix = format!("{}/", host);
-        let full = format!("{}{}", host, path);
-        if !full.starts_with(&prefix) {
-            return None;
-        }
-        let after = &full[prefix.len()..];
-        let sep = after.find("/-/")?;
-        let package_name = after[..sep].to_string();
-        let filename = &after[sep + 3..after.len() - 4];
+    fn check_version(&self, _name: &str, _version: &str, published_at: Option<Timestamp>) -> bool {
+        matches!(published_at, Some(t) if t <= self.cutoff)
+    }
+}
 
-        let base_name = if package_name.starts_with('@') {
-            package_name.rsplit('/').next()?
-        } else {
-            &package_name
+impl Registry for NpmRegistry {
+    fn known_hosts(&self) -> &[&str] {
+        KNOWN_HOSTS
+    }
+
+    fn prepare_request(&self, url: &Url, headers: &mut HeaderMap) {
+        if !self.is_metadata_url(url) {
+            return;
+        }
+        headers.insert("accept", "application/json".parse().unwrap());
+        headers.remove("accept-encoding");
+    }
+
+    fn handle_response(
+        &self,
+        url: &Url,
+        _status: u16,
+        response_headers: &HeaderMap,
+        body: &[u8],
+    ) -> ResponseAction {
+        if !self.is_metadata_url(url) {
+            return ResponseAction::Passthrough;
+        }
+
+        let content_encoding = response_headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("none");
+
+        if content_encoding != "none" && content_encoding != "identity" {
+            debug!("compressed npm metadata response, blocking");
+            return ResponseAction::Block;
+        }
+
+        let mut meta: NpmMetadata = match serde_json::from_slice(body) {
+            Ok(m) => m,
+            Err(_) => return ResponseAction::Passthrough,
         };
 
-        let version = filename
-            .strip_prefix(&format!("{}-", base_name))
-            .map(|v| v.to_string());
-
-        Some(PackageRef {
-            name: package_name,
-            version,
-        })
-    }
-
-    fn modify_request_headers(&self, headers: &mut HeaderMap) {
-        headers.insert("accept", "application/json".parse().unwrap());
-    }
-
-    fn modify_metadata_response(
-        &self,
-        body: &[u8],
-        headers: &HeaderMap,
-        check_version: &dyn Fn(&VersionInfo) -> RuleVerdict,
-    ) -> Option<Vec<u8>> {
-        let mut meta: NpmMetadata = serde_json::from_slice(body).ok()?;
-
         let mut to_remove = Vec::new();
+        let mut quarantined_versions = Vec::new();
+
         for (version, ts_str) in &meta.time {
             if version == "created" || version == "modified" {
                 continue;
             }
             let published_at: Option<Timestamp> = ts_str.parse().ok();
-            let info = VersionInfo {
-                name: meta.name.clone(),
-                version: version.clone(),
-                published_at,
-                ecosystem: super::Ecosystem::Javascript,
-            };
-            if let RuleVerdict::StripVersion = check_version(&info) {
+            if !self.check_version(&meta.name, version, published_at) {
                 to_remove.push(version.clone());
+                quarantined_versions.push(QuarantinedVersion {
+                    version: version.clone(),
+                    published_at,
+                });
             }
         }
 
+        let mut state = self.state.lock().unwrap();
+        state.packages_checked += 1;
+
         if to_remove.is_empty() {
-            return None;
+            return ResponseAction::Passthrough;
         }
 
         for v in &to_remove {
@@ -111,8 +138,24 @@ impl Registry for NpmRegistry {
             meta.dist_tags.insert("latest".into(), latest);
         }
 
-        clear_caching_headers(headers);
-        Some(serde_json::to_vec(&meta).unwrap_or_else(|_| body.to_vec()))
+        state.quarantined.push(QuarantinedPackage {
+            name: meta.name.clone(),
+            quarantined_versions,
+        });
+
+        match serde_json::to_vec(&meta) {
+            Ok(new_body) => ResponseAction::Rewrite { body: new_body },
+            Err(_) => ResponseAction::Passthrough,
+        }
+    }
+
+    fn stats(&self) -> RegistryStats {
+        let state = self.state.lock().unwrap();
+        RegistryStats {
+            packages_checked: state.packages_checked,
+            packages_quarantined: state.quarantined.clone(),
+            ..Default::default()
+        }
     }
 }
 
@@ -123,14 +166,9 @@ fn recalculate_latest(time: &BTreeMap<String, String>) -> Option<String> {
         .map(|(ver, _)| ver.clone())
 }
 
-fn clear_caching_headers(headers: &HeaderMap) {
-    let _ = headers;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rule::MinimumAge;
 
     fn load_fixture() -> Vec<u8> {
         std::fs::read("tests/data/npmjs/express.json").expect("fixture missing")
@@ -138,19 +176,21 @@ mod tests {
 
     #[test]
     fn npm_rewrite_against_real_metadata() {
+        let registry = NpmRegistry::new(Rules::new(365 * 24));
+        let cutoff = registry.test_cutoff();
+
         let body = load_fixture();
         let headers = HeaderMap::new();
-        let rule = MinimumAge::new(jiff::Span::new().hours(365 * 24));
-        let cutoff = rule.cutoff();
+        let url = Url::parse("https://registry.npmjs.org/express").unwrap();
 
-        let result =
-            NpmRegistry.modify_metadata_response(&body, &headers, &|info| rule.check(info));
+        let action = registry.handle_response(&url, 200, &headers, &body);
 
-        assert!(
-            result.is_some(),
-            "should rewrite — there are versions newer than 1 year"
-        );
-        let meta: NpmMetadata = serde_json::from_slice(result.as_ref().unwrap()).unwrap();
+        let new_body = match action {
+            ResponseAction::Rewrite { body } => body,
+            _ => panic!("expected rewrite, got {:?}", action),
+        };
+
+        let meta: NpmMetadata = serde_json::from_slice(&new_body).unwrap();
 
         for (version, ts_str) in &meta.time {
             if version == "created" || version == "modified" {
@@ -174,5 +214,27 @@ mod tests {
             meta.extra.contains_key("readme"),
             "extra fields like 'readme' should be preserved through round-trip"
         );
+
+        let stats = registry.stats();
+        assert_eq!(stats.packages_checked, 1);
+        assert!(!stats.packages_quarantined.is_empty());
+    }
+
+    #[test]
+    fn npm_passthrough_for_tarball() {
+        let registry = NpmRegistry::new(Rules::new(48));
+        let url = Url::parse("https://registry.npmjs.org/express/-/express-4.18.2.tgz").unwrap();
+        let action = registry.handle_response(&url, 200, &HeaderMap::new(), b"data");
+        assert!(matches!(action, ResponseAction::Passthrough));
+    }
+
+    #[test]
+    fn npm_blocks_compressed_metadata() {
+        let registry = NpmRegistry::new(Rules::new(48));
+        let url = Url::parse("https://registry.npmjs.org/express").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        let action = registry.handle_response(&url, 200, &headers, b"compressed data");
+        assert!(matches!(action, ResponseAction::Block));
     }
 }
