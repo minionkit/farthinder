@@ -71,9 +71,9 @@ bun install v1.3.11 (af24e281)
 | | macOS | Linux | Windows |
 |---|---|---|---|
 | Network interception (MITM proxy) | ✅ | 🔧 | 🔧 |
-| Kernel sandbox | 🔧 | 🔧 | 🔧 |
-| Sensitive file read protection | 🔧 | 🔧 | 🔧 |
-| File write restriction | 🔧 | 🔧 | 🔧 |
+| Kernel sandbox | ✅ | 🔧 | 🔧 |
+| Sensitive file read protection | ✅ | 🔧 | 🔧 |
+| File write restriction | ✅ | 🔧 | 🔧 |
 | Execution allowlist | 🔧 | 🔧 | 🔧 |
 | Privilege escalation blocking | 🔧 | 🔧 | 🔧 |
 | Symlink attack prevention | 🔧 | 🔧 | — |

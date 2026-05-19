@@ -5,6 +5,7 @@ use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
+#[derive(Debug)]
 struct HostCert {
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,

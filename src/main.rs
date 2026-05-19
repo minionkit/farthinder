@@ -1,5 +1,6 @@
 mod cert;
 mod config;
+mod install;
 mod interceptor;
 mod printer;
 mod proxy;
@@ -18,7 +19,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(clap::Subcommand)]
+#[derive(Debug, clap::Subcommand)]
 enum Commands {
     Install,
     Uninstall,
@@ -36,8 +37,8 @@ async fn main() -> anyhow::Result<()> {
     if exe_name == "fart" {
         let cli = Cli::parse();
         match cli.command {
-            Some(Commands::Install) => cmd_install(),
-            Some(Commands::Uninstall) => cmd_uninstall(),
+            Some(Commands::Install) => install::install(),
+            Some(Commands::Uninstall) => install::uninstall(),
             None => {
                 Cli::parse_from(["fart", "--help"]);
                 Ok(())
@@ -45,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         let interceptor = interceptor::Interceptor::new()?;
-        let status: std::process::ExitStatus = interceptor.run().await?;
+        let status = interceptor.run().await?;
         process::exit(status.code().unwrap_or(1));
     }
 }
@@ -57,14 +58,4 @@ fn current_exe_name() -> anyhow::Result<String> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid exe path"))?;
     Ok(name.to_string())
-}
-
-fn cmd_install() -> anyhow::Result<()> {
-    eprintln!("farthinder install not yet implemented");
-    process::exit(1);
-}
-
-fn cmd_uninstall() -> anyhow::Result<()> {
-    eprintln!("farthinder uninstall not yet implemented");
-    process::exit(1);
 }

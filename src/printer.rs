@@ -3,7 +3,7 @@ use rich_rust::markup;
 use rich_rust::prelude::*;
 use rich_rust::renderables::PaddingDimensions;
 
-use crate::registry::{Ecosystem, QuarantinedVersion, RegistryStats};
+use crate::registry::{Ecosystem, RegistryStats};
 
 pub struct Printer {
     console: Console,
@@ -21,17 +21,8 @@ impl Printer {
             Ecosystem::Javascript => "npm",
             Ecosystem::Python => "PyPI",
         };
-        let text = format!("Watching [bold cyan]{}[/] traffic", label);
-        let styled = markup::render_or_plain(&text);
-        self.console.line();
-        let panel = Panel::from_rich_text(&styled, self.console.width())
-            .title_from_markup("[bold]Farthinder[/]")
-            .title_align(JustifyMethod::Left)
-            .box_style(&HEAVY)
-            .border_style(Style::new().bold().color(Color::parse("cyan").unwrap()))
-            .padding(PaddingDimensions::symmetric(0, 2));
-        self.console.print_renderable(&panel);
-        self.console.line();
+        let content = format!("Watching [bold cyan]{}[/] traffic", label);
+        self.styled_panel("Farthinder", "cyan", &content);
     }
 
     pub fn summary(&self, stats: &RegistryStats) {
@@ -78,8 +69,6 @@ impl Printer {
             ));
         }
 
-        let content = lines.join("\n");
-        let styled = markup::render_or_plain(&content);
         let border_color = if !stats.downloads_blocked.is_empty() {
             "red"
         } else if !stats.packages_quarantined.is_empty() {
@@ -87,9 +76,15 @@ impl Printer {
         } else {
             "green"
         };
+
+        self.styled_panel("Farthinder Summary", border_color, &lines.join("\n"));
+    }
+
+    fn styled_panel(&self, title: &str, border_color: &str, content: &str) {
+        let styled = markup::render_or_plain(content);
         self.console.line();
         let panel = Panel::from_rich_text(&styled, self.console.width())
-            .title_from_markup("[bold]Farthinder Summary[/]")
+            .title_from_markup(format!("[bold]{title}[/]").as_str())
             .title_align(JustifyMethod::Left)
             .box_style(&HEAVY)
             .border_style(
@@ -103,14 +98,14 @@ impl Printer {
     }
 }
 
-fn format_quarantined_versions(versions: &[QuarantinedVersion]) -> String {
-    let mut sorted: Vec<&QuarantinedVersion> = versions.iter().collect();
-    sorted.sort_by_key(|v| &v.version);
+fn format_quarantined_versions(versions: &[String]) -> String {
+    let mut sorted: Vec<&str> = versions.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
     let max_show = 3;
     if sorted.len() <= max_show {
-        sorted.iter().map(|v| v.version.as_str()).collect::<Vec<_>>().join(", ")
+        sorted.join(", ")
     } else {
-        let shown: Vec<&str> = sorted.iter().take(max_show).map(|v| v.version.as_str()).collect();
+        let shown: Vec<&str> = sorted.iter().take(max_show).copied().collect();
         format!("{}, and {} more", shown.join(", "), sorted.len() - max_show)
     }
 }

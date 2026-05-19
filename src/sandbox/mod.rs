@@ -1,18 +1,19 @@
 #[cfg(target_os = "macos")]
 mod macos;
-mod nop;
+#[cfg(target_os = "linux")]
+mod linux;
 
 use std::path::PathBuf;
-
-#[allow(unused_imports)]
-pub use nop::NopEnforcer;
 
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
     pub proxy_port: u16,
-    pub deny_read_paths: Vec<PathBuf>,
+    pub cwd: PathBuf,
+    pub home: PathBuf,
+    pub sensitive_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
 pub struct WrappedCommand {
     pub program: String,
     pub args: Vec<String>,
@@ -30,10 +31,16 @@ pub fn get_enforcer() -> Option<Box<dyn SandboxEnforcer>> {
             return Some(Box::new(macos::MacosEnforcer));
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        if linux::LandlockEnforcer::is_available() {
+            return Some(Box::new(linux::LandlockEnforcer));
+        }
+    }
     None
 }
 
-pub fn deny_read_paths() -> Vec<PathBuf> {
+pub fn sensitive_paths() -> Vec<PathBuf> {
     let home = directories::BaseDirs::new()
         .map(|bd| bd.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()));

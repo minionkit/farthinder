@@ -1,8 +1,12 @@
 pub mod npm;
 pub mod pypi;
 
+use std::path::Path;
+
 use http::HeaderMap;
 use jiff::Timestamp;
+use strum::{EnumString, Display, EnumIter};
+use tracing::debug;
 use url::Url;
 
 use crate::rule::Rules;
@@ -11,6 +15,42 @@ use crate::rule::Rules;
 pub enum Ecosystem {
     Javascript,
     Python,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, Display, EnumIter)]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+pub enum ToolName {
+    Bun,
+    Bunx,
+    Npm,
+    Npx,
+    Pnpm,
+    Yarn,
+    Pip,
+    Pip3,
+    Uv,
+    Uvx,
+    Pipx,
+    Poetry,
+}
+
+impl ToolName {
+    pub fn ecosystem(&self) -> Option<Ecosystem> {
+        match self {
+            ToolName::Bun
+            | ToolName::Bunx
+            | ToolName::Npm
+            | ToolName::Npx
+            | ToolName::Pnpm
+            | ToolName::Yarn => Some(Ecosystem::Javascript),
+            ToolName::Pip
+            | ToolName::Pip3
+            | ToolName::Uv
+            | ToolName::Uvx
+            | ToolName::Pipx
+            | ToolName::Poetry => Some(Ecosystem::Python),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,14 +77,7 @@ impl RegistryStats {
 #[derive(Debug, Clone)]
 pub struct QuarantinedPackage {
     pub name: String,
-    pub quarantined_versions: Vec<QuarantinedVersion>,
-}
-
-#[derive(Debug, Clone)]
-pub struct QuarantinedVersion {
-    pub version: String,
-    #[allow(dead_code)]
-    pub published_at: Option<Timestamp>,
+    pub quarantined_versions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +97,7 @@ pub trait Registry: Send + Sync {
         body: &[u8],
     ) -> ResponseAction;
     fn stats(&self) -> RegistryStats;
+    fn proxy_env_vars(&self, proxy_url: &str, ca_cert_path: &Path) -> Vec<(String, String)>;
 }
 
 impl Ecosystem {
@@ -73,4 +107,44 @@ impl Ecosystem {
             Ecosystem::Python => Box::new(pypi::PyPIRegistry::new(rules)),
         }
     }
+}
+
+pub(crate) struct CutoffChecker {
+    cutoff: Timestamp,
+}
+
+impl CutoffChecker {
+    pub fn new(min_age_hours: u32) -> Self {
+        Self {
+            cutoff: Timestamp::now() - jiff::Span::new().hours(min_age_hours as i64),
+        }
+    }
+
+    pub fn is_old_enough(&self, ts: Option<Timestamp>) -> bool {
+        matches!(ts, Some(t) if t <= self.cutoff)
+    }
+
+    #[cfg(test)]
+    pub fn cutoff(&self) -> Timestamp {
+        self.cutoff
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RegistryState {
+    pub packages_checked: usize,
+    pub quarantined: Vec<QuarantinedPackage>,
+}
+
+fn reject_compressed(response_headers: &HeaderMap) -> Option<ResponseAction> {
+    let content_encoding = response_headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none");
+
+    if content_encoding != "none" && content_encoding != "identity" {
+        debug!("compressed metadata response, blocking");
+        return Some(ResponseAction::Block);
+    }
+    None
 }

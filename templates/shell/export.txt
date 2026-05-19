@@ -1,0 +1,2 @@
+export FARTHINDER_HOME="$HOME/.farthinder"
+export PATH="$FARTHINDER_HOME/bin:$PATH"

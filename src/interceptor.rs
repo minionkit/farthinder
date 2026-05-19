@@ -12,10 +12,11 @@ use tracing::debug;
 use crate::config;
 use crate::printer::Printer;
 use crate::proxy::ProxyServer;
-use crate::registry::{Ecosystem, Registry};
+use crate::registry::{Ecosystem, Registry, ToolName};
 use crate::rule::Rules;
 use crate::sandbox::{self, SandboxPolicy, WrappedCommand};
 
+#[derive(Debug)]
 pub struct Interceptor {
     target: PathBuf,
     arg0: String,
@@ -32,11 +33,10 @@ impl Interceptor {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid exe name"))?;
         let target = find_target_executable(tool_name)?;
-        let ecosystem = match tool_name {
-            "bun" | "bunx" | "npm" | "npx" | "pnpm" | "yarn" => Some(Ecosystem::Javascript),
-            "pip" | "pip3" | "uv" | "uvx" | "pipx" | "poetry" => Some(Ecosystem::Python),
-            _ => None,
-        };
+        let ecosystem = tool_name
+            .parse::<ToolName>()
+            .ok()
+            .and_then(|t| t.ecosystem());
         Ok(Interceptor {
             target,
             arg0,
@@ -51,7 +51,7 @@ impl Interceptor {
             return cmd.status().context("execute command");
         };
 
-        let cfg = config::load().unwrap_or_default();
+        let cfg = config::load()?;
         debug!("config: min_age_hours={}, sandbox_required={}", cfg.min_age_hours, cfg.sandbox_required);
 
         let rules = Rules::new(cfg.min_age_hours);
@@ -64,36 +64,7 @@ impl Interceptor {
         let ca_cert_path = write_ca_cert_temp(&proxy.ca_cert_pem)?;
         let proxy_port = proxy.port();
 
-        let mut env_vars = match ecosystem {
-            Ecosystem::Javascript => vec![
-                ("npm_config_proxy".to_string(), proxy.url.clone()),
-                ("npm_config_https_proxy".to_string(), proxy.url.clone()),
-                ("HTTP_PROXY".to_string(), proxy.url.clone()),
-                ("HTTPS_PROXY".to_string(), proxy.url.clone()),
-                (
-                    "NODE_EXTRA_CA_CERTS".to_string(),
-                    ca_cert_path.to_string_lossy().to_string(),
-                ),
-            ],
-            Ecosystem::Python => vec![
-                ("HTTP_PROXY".to_string(), proxy.url.clone()),
-                ("HTTPS_PROXY".to_string(), proxy.url.clone()),
-                ("http_proxy".to_string(), proxy.url.clone()),
-                ("https_proxy".to_string(), proxy.url.clone()),
-                (
-                    "REQUESTS_CA_BUNDLE".to_string(),
-                    ca_cert_path.to_string_lossy().to_string(),
-                ),
-                (
-                    "SSL_CERT_FILE".to_string(),
-                    ca_cert_path.to_string_lossy().to_string(),
-                ),
-                (
-                    "PIP_CERT".to_string(),
-                    ca_cert_path.to_string_lossy().to_string(),
-                ),
-            ],
-        };
+        let proxy_env = registry.proxy_env_vars(&proxy.url, &ca_cert_path);
 
         let enforcer = sandbox::get_enforcer();
         if cfg.sandbox_required && enforcer.is_none() {
@@ -103,33 +74,34 @@ impl Interceptor {
         }
 
         let status = if let Some(enforcer) = &enforcer {
+            let home = directories::BaseDirs::new()
+                .map(|bd| bd.home_dir().to_path_buf())
+                .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()));
+
             let policy = SandboxPolicy {
                 proxy_port,
-                deny_read_paths: sandbox::deny_read_paths(),
+                cwd: env::current_dir().context("get cwd")?,
+                home,
+                sensitive_paths: sandbox::sensitive_paths(),
             };
 
             let wrapped = WrappedCommand {
                 program: self.target.to_string_lossy().to_string(),
                 args: env::args().skip(1).collect(),
-                env: env_vars.clone(),
+                env: proxy_env,
             };
 
             let sandboxed = enforcer.wrap_command(&policy, &wrapped)?;
-            env_vars = sandboxed.env;
-
-            let mut cmd = Command::new(&sandboxed.program);
-            cmd.arg0(&self.arg0).args(&sandboxed.args);
-            for (k, v) in &env_vars {
-                cmd.env(k, v);
-            }
+            let mut cmd = build_command(&sandboxed, &self.arg0);
             debug!("executing sandboxed {:?}", cmd.get_program());
             cmd.status().context("execute sandboxed command")
         } else {
-            let mut cmd = Command::new(&self.target);
-            cmd.arg0(&self.arg0).args(env::args().skip(1));
-            for (k, v) in &env_vars {
-                cmd.env(k, v);
-            }
+            let wrapped = WrappedCommand {
+                program: self.target.to_string_lossy().to_string(),
+                args: env::args().skip(1).collect(),
+                env: proxy_env,
+            };
+            let mut cmd = build_command(&wrapped, &self.arg0);
             debug!("executing unsandboxed");
             cmd.status().context("execute command")
         };
@@ -147,10 +119,19 @@ impl Interceptor {
     }
 }
 
+fn build_command(wrapped: &WrappedCommand, arg0: &str) -> Command {
+    let mut cmd = Command::new(&wrapped.program);
+    cmd.arg0(arg0).args(&wrapped.args);
+    for (k, v) in &wrapped.env {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
 fn write_ca_cert_temp(pem: &str) -> anyhow::Result<PathBuf> {
     let dir = std::env::temp_dir().join("farthinder");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join("ca.pem");
+    let path = dir.join(format!("ca-{}.pem", std::process::id()));
     std::fs::write(&path, pem)?;
     Ok(path)
 }
@@ -166,13 +147,6 @@ fn find_target_executable(tool_name: &str) -> anyhow::Result<PathBuf> {
 
     for path_dir in env::split_paths(&path_var) {
         let potential_bin = path_dir.join(tool_name);
-
-        #[cfg(windows)]
-        let potential_bin = if !potential_bin.exists() {
-            path_dir.join(format!("{}.exe", tool_name))
-        } else {
-            potential_bin
-        };
 
         if potential_bin.exists() {
             if !found_shim && potential_bin.parent() == Some(shim_dir) {

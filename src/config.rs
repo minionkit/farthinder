@@ -1,14 +1,14 @@
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct AppConfig {
     #[serde(default = "default_min_age_hours")]
-    pub min_age_hours: u64,
+    pub min_age_hours: u32,
     #[serde(default = "default_true")]
     pub sandbox_required: bool,
 }
 
-fn default_min_age_hours() -> u64 {
+fn default_min_age_hours() -> u32 {
     48
 }
 
@@ -31,13 +31,4 @@ pub fn load() -> anyhow::Result<AppConfig> {
 
     let config: AppConfig = figment.merge(Env::prefixed("FARTHINDER_")).extract()?;
     Ok(config)
-}
-
-#[allow(dead_code)]
-pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "farthinder")
-        .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
-    let dir = dirs.data_dir().to_path_buf();
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
 }

@@ -19,6 +19,7 @@ use crate::registry::{Registry, ResponseAction};
 
 pub struct ProxyServer {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    port: u16,
     pub url: String,
     pub ca_cert_pem: String,
     tunneled: Arc<AtomicUsize>,
@@ -30,11 +31,12 @@ impl ProxyServer {
             .await
             .context("bind proxy port")?;
         let proxy_addr = listener.local_addr()?;
+        let port = proxy_addr.port();
         let proxy_url = format!("http://{}", proxy_addr);
         debug!("proxy listening {}", proxy_url);
 
         let ca_state = Arc::new(Mutex::new(CaState::new()?));
-        let ca_cert_pem = ca_state.lock().unwrap().ca_cert_pem().to_string();
+        let ca_cert_pem = ca_state.lock().expect("ca state lock").ca_cert_pem().to_string();
         let tunneled = Arc::new(AtomicUsize::new(0));
 
         let core = ProxyCore {
@@ -48,6 +50,7 @@ impl ProxyServer {
 
         Ok(ProxyServer {
             shutdown_tx,
+            port,
             url: proxy_url,
             ca_cert_pem,
             tunneled,
@@ -59,11 +62,7 @@ impl ProxyServer {
     }
 
     pub fn port(&self) -> u16 {
-        self.url
-            .rsplit(':')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
+        self.port
     }
 
     pub fn tunneled(&self) -> usize {
@@ -71,6 +70,7 @@ impl ProxyServer {
     }
 }
 
+#[derive(Clone)]
 struct ProxyCore {
     registry: Arc<dyn Registry>,
     ca_state: Arc<Mutex<CaState>>,
@@ -88,7 +88,7 @@ impl ProxyCore {
                 accept_result = listener.accept() => {
                     let (stream, addr) = accept_result?;
                     debug!("accepted {}", addr);
-                    let core = self.clone_core();
+                    let core = self.clone();
                     tokio::spawn(async move {
                         if let Err(e) = core.handle_connection(stream).await {
                             warn!("connection error: {:#}", e);
@@ -97,14 +97,6 @@ impl ProxyCore {
                 }
                 _ = &mut shutdown_rx => return Ok(()),
             }
-        }
-    }
-
-    fn clone_core(&self) -> ProxyCore {
-        ProxyCore {
-            registry: self.registry.clone(),
-            ca_state: self.ca_state.clone(),
-            tunneled: self.tunneled.clone(),
         }
     }
 
@@ -119,20 +111,20 @@ impl ProxyCore {
             let stream = reader.into_inner();
             self.handle_connect(stream, &host_port).await
         } else {
-            handle_http(reader, first_line).await
+            reject_plain_http(reader).await
         }
     }
 
     async fn handle_connect(&self, client: TcpStream, host_port: &str) -> anyhow::Result<()> {
-        let (host, port) = parse_host_port(host_port);
-        debug!("CONNECT {}:{}", host, port);
+        let hp = parse_host_port(host_port);
+        debug!("CONNECT {}:{}", hp.host, hp.port);
 
-        let is_registry_host = self.registry.known_hosts().iter().any(|h| host == *h);
+        let is_registry_host = self.registry.known_hosts().iter().any(|h| hp.host == *h);
         if is_registry_host {
-            self.handle_mitm(client, host, port).await
+            self.handle_mitm(client, hp).await
         } else {
             self.tunneled.fetch_add(1, Ordering::Relaxed);
-            self.handle_tunnel(client, &host, port).await
+            self.handle_tunnel(client, &hp.host, hp.port).await
         }
     }
 
@@ -156,22 +148,21 @@ impl ProxyCore {
     async fn handle_mitm(
         &self,
         mut client: TcpStream,
-        host: String,
-        port: u16,
+        hp: HostPort,
     ) -> anyhow::Result<()> {
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        let acceptor = self.ca_state.lock().unwrap().tls_acceptor_for_host(&host)?;
+        let acceptor = self.ca_state.lock().expect("ca state lock").tls_acceptor_for_host(&hp.host)?;
         let tls_stream = acceptor.accept(client).await?;
         let io = TokioIo::new(tls_stream);
 
-        let upstream = UpstreamForwarder { host: host.clone(), port };
+        let upstream = UpstreamForwarder { host: hp.host.clone(), port: hp.port };
         let svc = RegistryMiddleware {
             inner: upstream,
             registry: self.registry.clone(),
-            mitm_host: host,
+            mitm_host: hp.host,
         };
 
         hyper::server::conn::http1::Builder::new()
@@ -180,6 +171,12 @@ impl ProxyCore {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+struct HostPort {
+    host: String,
+    port: u16,
 }
 
 #[derive(Clone)]
@@ -235,7 +232,7 @@ impl hyper::service::Service<hyper::Request<Incoming>> for RegistryMiddleware {
 
             let action = match &url {
                 Some(url) => registry.handle_response(url, parts.status.as_u16(), &parts.headers, &bytes),
-                None => ResponseAction::Passthrough,
+                None => ResponseAction::Block,
             };
 
             match action {
@@ -299,12 +296,11 @@ async fn forward_https(
     let forward_req = builder.body(req.into_body())?;
 
     let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store())
+        .with_root_certificates(root_store()?)
         .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
 
-    let addr = format!("{}:{}", host, port);
-    let stream = TcpStream::connect(&addr).await?;
+    let stream = TcpStream::connect((host, port)).await?;
     let domain = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| anyhow::anyhow!("invalid domain: {}", e))?;
     let tls_stream = connector.connect(domain, stream).await?;
@@ -323,71 +319,43 @@ async fn forward_https(
     Ok(hyper::Response::from_parts(parts, mapped))
 }
 
-fn root_store() -> Arc<rustls::RootCertStore> {
+fn root_store() -> anyhow::Result<Arc<rustls::RootCertStore>> {
     let mut store = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().expect("load native certs") {
+    let result = rustls_native_certs::load_native_certs();
+    if !result.errors.is_empty() {
+        anyhow::bail!("failed to load native certs: {} errors", result.errors.len());
+    }
+    for cert in result.certs {
         store.add(cert).ok();
     }
-    Arc::new(store)
+    Ok(Arc::new(store))
 }
 
 fn parse_connect_host(line: &str) -> anyhow::Result<String> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 {
-        anyhow::bail!("invalid CONNECT request");
-    }
-    Ok(parts[1].to_string())
+    let mut parts = line.split_whitespace();
+    parts.next();
+    parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid CONNECT request"))
+        .map(str::to_string)
 }
 
-fn parse_host_port(host_port: &str) -> (String, u16) {
+fn parse_host_port(host_port: &str) -> HostPort {
     let mut parts = host_port.splitn(2, ':');
     let host = parts.next().unwrap_or("localhost").to_string();
     let port: u16 = parts.next().unwrap_or("443").parse().unwrap_or(443);
-    (host, port)
+    HostPort { host, port }
 }
 
-async fn handle_http(mut reader: BufReader<TcpStream>, first_line: Vec<u8>) -> anyhow::Result<()> {
-    let mut headers_buf = first_line;
+async fn reject_plain_http(mut reader: BufReader<TcpStream>) -> anyhow::Result<()> {
+    let mut line = Vec::new();
     loop {
-        let mut line = Vec::new();
+        line.clear();
         tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line).await?;
-        headers_buf.extend_from_slice(&line);
         if line == b"\r\n" || line == b"\n" || line.is_empty() {
             break;
         }
     }
-
-    let request_str = String::from_utf8_lossy(&headers_buf);
-    let first_line = request_str.lines().next().context("empty request")?;
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        anyhow::bail!("malformed HTTP request");
-    }
-    let method = parts[0];
-    let raw_url = parts[1];
-
-    let url = url::Url::parse(raw_url).context("parse target URL")?;
-    let host = url.host_str().context("missing host")?;
-    let port = url.port_or_known_default().unwrap_or(80);
-
-    let addr = format!("{}:{}", host, port);
-    let mut target = TcpStream::connect(&addr).await?;
-
-    let path = if let Some(query) = url.query() {
-        format!("{}?{}", url.path(), query)
-    } else {
-        url.path().to_string()
-    };
-
-    let forward_req = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        method, path, host
-    );
-
-    target.write_all(forward_req.as_bytes()).await?;
-
-    let mut remaining = reader;
-    tokio::io::copy(&mut remaining, &mut target).await.ok();
-
+    warn!("plain HTTP request rejected (only HTTPS CONNECT is supported)");
     Ok(())
 }

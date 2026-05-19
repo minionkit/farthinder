@@ -5,9 +5,9 @@
 (allow process-exec)
 
 (allow file-read*)
-{% if has_deny_read_paths %}
+{% if has_sensitive_paths %}
 (deny file-read*
-{% for path in deny_read_paths %}
+{% for path in sensitive_paths %}
     (subpath "{{ path }}")
 {% endfor %}
 )
@@ -19,7 +19,16 @@
     (subpath "/private/var/folders")
     (literal "/dev/null")
     (literal "/dev/zero")
+    (subpath "{{ cwd }}")
+    (subpath "{{ home }}")
 )
+{% if has_sensitive_paths %}
+(deny file-write*
+{% for path in sensitive_paths %}
+    (subpath "{{ path }}")
+{% endfor %}
+)
+{% endif %}
 
 (deny network*)
 (allow network-outbound

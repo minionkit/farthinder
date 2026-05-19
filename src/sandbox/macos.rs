@@ -58,21 +58,25 @@ fn write_sbpl_tempfile(content: &str) -> anyhow::Result<std::path::PathBuf> {
 #[template(path = "sbpl.txt")]
 struct SbplTemplate {
     proxy_port: u16,
-    deny_read_paths: Vec<String>,
-    has_deny_read_paths: bool,
+    cwd: String,
+    home: String,
+    sensitive_paths: Vec<String>,
+    has_sensitive_paths: bool,
 }
 
 fn generate_sbpl(policy: &SandboxPolicy) -> String {
-    let deny_paths: Vec<String> = policy
-        .deny_read_paths
+    let paths: Vec<String> = policy
+        .sensitive_paths
         .iter()
         .map(|p| p.display().to_string())
         .collect();
-    let has = !deny_paths.is_empty();
+    let has = !paths.is_empty();
     SbplTemplate {
         proxy_port: policy.proxy_port,
-        deny_read_paths: deny_paths,
-        has_deny_read_paths: has,
+        cwd: policy.cwd.display().to_string(),
+        home: policy.home.display().to_string(),
+        sensitive_paths: paths,
+        has_sensitive_paths: has,
     }
     .render()
     .expect("SBPL template rendering")
@@ -94,6 +98,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::thread;
 
@@ -113,7 +118,11 @@ mod tests {
     fn run_under_sbpl(proxy_port: u16, url: &str) -> std::process::Output {
         let policy = SandboxPolicy {
             proxy_port,
-            deny_read_paths: vec![],
+            cwd: std::env::current_dir().unwrap(),
+            home: directories::BaseDirs::new()
+                .map(|bd| bd.home_dir().to_path_buf())
+                .unwrap_or_default(),
+            sensitive_paths: vec![],
         };
         let sbpl_path = write_test_sbpl(&policy);
 
@@ -154,7 +163,9 @@ mod tests {
     fn sbpl_contains_deny_default() {
         let policy = SandboxPolicy {
             proxy_port: 8080,
-            deny_read_paths: vec![std::path::PathBuf::from("/Users/test/.ssh")],
+            cwd: PathBuf::from("/Users/test/project"),
+            home: PathBuf::from("/Users/test"),
+            sensitive_paths: vec![PathBuf::from("/Users/test/.ssh")],
         };
         let sbpl = generate_sbpl(&policy);
         assert!(sbpl.contains("(deny default)"));

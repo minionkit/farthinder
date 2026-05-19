@@ -1,0 +1,2 @@
+set -gx FARTHINDER_HOME $HOME/.farthinder
+set -gx PATH $FARTHINDER_HOME/bin $PATH

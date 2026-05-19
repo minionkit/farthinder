@@ -1,22 +1,18 @@
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use http::HeaderMap;
-use serde_json::Value;
-use tracing::debug;
+use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use url::Url;
 
-use super::{BlockedItem, Registry, RegistryStats, ResponseAction};
+use super::{reject_compressed, CutoffChecker, QuarantinedPackage, Registry, RegistryState, RegistryStats, ResponseAction};
 use crate::rule::Rules;
 
 pub struct PyPIRegistry {
-    cutoff: jiff::Timestamp,
-    state: Mutex<PyPIState>,
-}
-
-struct PyPIState {
-    packages_checked: usize,
-    quarantined: Vec<String>,
-    blocked: Vec<BlockedItem>,
+    checker: CutoffChecker,
+    state: Mutex<RegistryState>,
 }
 
 const KNOWN_HOSTS: &[&str] = &[
@@ -26,20 +22,41 @@ const KNOWN_HOSTS: &[&str] = &[
     "pythonhosted.org",
 ];
 
+#[derive(Deserialize, Serialize)]
+struct PyPIFile {
+    filename: String,
+    #[serde(default)]
+    upload_time_iso_8601: Option<String>,
+    digests: Option<Digests>,
+    md5_digest: Option<String>,
+    #[serde(default)]
+    yanked: bool,
+    yanked_reason: Option<String>,
+    packagetype: String,
+    size: Option<i64>,
+    requires_python: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Digests {
+    sha256: Option<String>,
+    md5: Option<String>,
+    blake2b_256: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, serde_json::Value>,
+}
+
 impl PyPIRegistry {
     pub fn new(rules: Rules) -> Self {
-        let cutoff = jiff::Timestamp::now() - jiff::Span::new().hours(rules.min_age_hours() as i64);
         PyPIRegistry {
-            cutoff,
-            state: Mutex::new(PyPIState {
-                packages_checked: 0,
-                quarantined: Vec::new(),
-                blocked: Vec::new(),
-            }),
+            checker: CutoffChecker::new(rules.min_age_hours()),
+            state: Mutex::new(RegistryState::default()),
         }
     }
 
-    fn is_metadata_url(&self, url: &Url) -> bool {
+    fn is_metadata_url(url: &Url) -> bool {
         let segments: Vec<&str> = url.path_segments().map(|s| s.collect()).unwrap_or_default();
         if segments.len() >= 2 && segments[0] == "simple" {
             return true;
@@ -49,19 +66,23 @@ impl PyPIRegistry {
             && segments.last() == Some(&"json")
     }
 
-    fn check_version(&self, _version: &str, published_at: Option<jiff::Timestamp>) -> bool {
-        matches!(published_at, Some(t) if t <= self.cutoff)
+    fn version_timestamp(files: &[PyPIFile]) -> Option<Timestamp> {
+        files
+            .iter()
+            .filter_map(|f| f.upload_time_iso_8601.as_ref())
+            .filter_map(|ts| ts.parse::<Timestamp>().ok())
+            .max()
     }
 
-    fn parse_package_from_url(&self, url: &Url) -> Option<PackageRef> {
+    fn parse_version_from_url(url: &Url) -> Option<String> {
         let raw = url.path_segments()?.next_back()?;
-        let filename = percent_decode_str(raw);
+        let filename = urlencoding::decode(raw).map(|s| s.to_string()).unwrap_or_default();
 
         if let Some(stripped) = filename.strip_suffix(".whl.metadata") {
-            return parse_wheel(stripped);
+            return parse_wheel_version(stripped);
         }
         if let Some(stripped) = filename.strip_suffix(".whl") {
-            return parse_wheel(stripped);
+            return parse_wheel_version(stripped);
         }
 
         for ext in &[
@@ -76,26 +97,16 @@ impl PyPIRegistry {
         ] {
             if let Some(stripped) = filename.strip_suffix(ext) {
                 let last_dash = stripped.rfind('-')?;
-                let name = &stripped[..last_dash];
                 let version = &stripped[last_dash + 1..];
-                if version == "latest" || name.is_empty() || version.is_empty() {
+                if version == "latest" || version.is_empty() {
                     return None;
                 }
-                return Some(PackageRef {
-                    name: name.to_string(),
-                    version: Some(version.to_string()),
-                });
+                return Some(version.to_string());
             }
         }
 
         None
     }
-}
-
-struct PackageRef {
-    #[allow(dead_code)]
-    name: String,
-    version: Option<String>,
 }
 
 impl Registry for PyPIRegistry {
@@ -104,7 +115,7 @@ impl Registry for PyPIRegistry {
     }
 
     fn prepare_request(&self, url: &Url, headers: &mut HeaderMap) {
-        if !self.is_metadata_url(url) {
+        if !Self::is_metadata_url(url) {
             return;
         }
         headers.remove("if-none-match");
@@ -119,18 +130,12 @@ impl Registry for PyPIRegistry {
         response_headers: &HeaderMap,
         body: &[u8],
     ) -> ResponseAction {
-        if !self.is_metadata_url(url) {
+        if !Self::is_metadata_url(url) {
             return ResponseAction::Passthrough;
         }
 
-        let content_encoding = response_headers
-            .get("content-encoding")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("none");
-
-        if content_encoding != "none" && content_encoding != "identity" {
-            debug!("compressed pypi metadata response, blocking");
-            return ResponseAction::Block;
+        if let Some(action) = reject_compressed(response_headers) {
+            return action;
         }
 
         let content_type = response_headers
@@ -139,107 +144,109 @@ impl Registry for PyPIRegistry {
             .unwrap_or("");
 
         if content_type.contains("html") {
-            return self.handle_html_response(body);
+            return ResponseAction::Block;
         }
         if content_type.contains("json") {
             return self.handle_json_response(body);
         }
 
-        ResponseAction::Passthrough
+        ResponseAction::Block
     }
 
     fn stats(&self) -> RegistryStats {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("pypi state lock");
         RegistryStats {
             packages_checked: state.packages_checked,
-            downloads_blocked: state.blocked.clone(),
+            packages_quarantined: state.quarantined.clone(),
             ..Default::default()
         }
+    }
+
+    fn proxy_env_vars(&self, proxy_url: &str, ca_cert_path: &std::path::Path) -> Vec<(String, String)> {
+        vec![
+            ("HTTP_PROXY".to_string(), proxy_url.to_string()),
+            ("HTTPS_PROXY".to_string(), proxy_url.to_string()),
+            ("http_proxy".to_string(), proxy_url.to_string()),
+            ("https_proxy".to_string(), proxy_url.to_string()),
+            ("REQUESTS_CA_BUNDLE".to_string(), ca_cert_path.to_string_lossy().to_string()),
+            ("SSL_CERT_FILE".to_string(), ca_cert_path.to_string_lossy().to_string()),
+            ("PIP_CERT".to_string(), ca_cert_path.to_string_lossy().to_string()),
+        ]
     }
 }
 
 impl PyPIRegistry {
-    fn handle_html_response(&self, body: &[u8]) -> ResponseAction {
-        let html = String::from_utf8_lossy(body);
-        let mut modified = false;
-        let mut result = String::new();
-        let mut remaining = html.as_ref();
+    fn handle_json_response(&self, body: &[u8]) -> ResponseAction {
+        let mut json: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => return ResponseAction::Block,
+        };
 
-        while let Some(anchor_start) = remaining.find("<a ") {
-            result.push_str(&remaining[..anchor_start]);
-            remaining = &remaining[anchor_start..];
-            let anchor_end = match remaining.find("</a>") {
-                Some(pos) => pos,
-                None => break,
-            };
-            let anchor = &remaining[..anchor_end + 4];
+        let mut quarantined_versions = Vec::new();
 
-            if let Some(href) = extract_href(anchor)
-                && let Ok(url) = Url::parse(&format!("https://files.pythonhosted.org{}", href))
-                && let Some(pkg) = self.parse_package_from_url(&url)
-                && let Some(version) = &pkg.version
-                && !self.check_version(version, None)
-            {
-                modified = true;
-                self.state.lock().unwrap().quarantined.push(version.clone());
-                remaining = &remaining[anchor_end + 4..];
+        let parsed_releases: BTreeMap<String, Vec<PyPIFile>> = match json.get("releases") {
+            Some(r) => match serde_json::from_value::<BTreeMap<String, Vec<PyPIFile>>>(r.clone()) {
+                Ok(r) => r,
+                Err(_) => return ResponseAction::Block,
+            },
+            None => return ResponseAction::Passthrough,
+        };
+
+        let mut to_remove = Vec::new();
+        for (version, files) in &parsed_releases {
+            if files.is_empty() {
                 continue;
             }
-
-            result.push_str(anchor);
-            remaining = &remaining[anchor_end + 4..];
-        }
-        result.push_str(remaining);
-
-        if modified {
-            self.state.lock().unwrap().packages_checked += 1;
-            ResponseAction::Rewrite {
-                body: result.into_bytes(),
+            let ts = Self::version_timestamp(files);
+            if !self.checker.is_old_enough(ts) {
+                to_remove.push(version.clone());
+                quarantined_versions.push(version.clone());
             }
-        } else {
-            ResponseAction::Passthrough
         }
-    }
 
-    fn handle_json_response(&self, body: &[u8]) -> ResponseAction {
-        let mut json: Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(_) => return ResponseAction::Passthrough,
-        };
-        let mut modified = false;
+        {
+            let mut state = self.state.lock().expect("pypi state lock");
+            state.packages_checked += 1;
+        }
 
-        if let Some(files) = json.get_mut("files").and_then(|f| f.as_array_mut()) {
-            let this = self;
-            files.retain(|entry| {
+        if !to_remove.is_empty()
+            && let Some(releases) = json.get_mut("releases").and_then(|r| r.as_object_mut())
+        {
+            for version in &to_remove {
+                releases.remove(version);
+            }
+        }
+
+        if let Some(urls) = json.get_mut("urls").and_then(|u| u.as_array_mut()) {
+            urls.retain(|entry| {
                 let filename = entry.get("filename").and_then(|f| f.as_str()).unwrap_or("");
                 let fake_url = format!("https://files.pythonhosted.org/packages/{}", filename);
-                if let Ok(url) = Url::parse(&fake_url)
-                    && let Some(pkg) = this.parse_package_from_url(&url)
-                    && let Some(version) = pkg.version
-                    && !this.check_version(&version, None)
-                {
-                    modified = true;
-                    return false;
-                }
-                true
+                let Ok(url) = Url::parse(&fake_url) else {
+                    return true;
+                };
+                let Some(version) = Self::parse_version_from_url(&url) else {
+                    return true;
+                };
+                !to_remove.contains(&version)
             });
         }
 
-        if let Some(releases) = json.get_mut("releases").and_then(|r| r.as_object_mut()) {
-            let keys: Vec<String> = releases.keys().cloned().collect();
-            for version in keys {
-                if !self.check_version(&version, None) {
-                    releases.remove(&version);
-                    modified = true;
-                }
+        if !to_remove.is_empty() {
+            {
+                let mut state = self.state.lock().expect("pypi state lock");
+                state.quarantined.push(QuarantinedPackage {
+                    name: json
+                        .get("info")
+                        .and_then(|i| i.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    quarantined_versions,
+                });
             }
-        }
-
-        if modified {
-            self.state.lock().unwrap().packages_checked += 1;
             match serde_json::to_vec(&json) {
                 Ok(new_body) => ResponseAction::Rewrite { body: new_body },
-                Err(_) => ResponseAction::Passthrough,
+                Err(_) => ResponseAction::Block,
             }
         } else {
             ResponseAction::Passthrough
@@ -247,41 +254,133 @@ impl PyPIRegistry {
     }
 }
 
-fn parse_wheel(base: &str) -> Option<PackageRef> {
+fn parse_wheel_version(base: &str) -> Option<String> {
     let first_dash = base.find('-')?;
-    let name = &base[..first_dash];
     let rest = &base[first_dash + 1..];
     let second_dash = rest.find('-').unwrap_or(rest.len());
     let version = &rest[..second_dash];
-    if version == "latest" || name.is_empty() || version.is_empty() {
+    if version == "latest" || version.is_empty() {
         return None;
     }
-    Some(PackageRef {
-        name: name.to_string(),
-        version: Some(version.to_string()),
-    })
+    Some(version.to_string())
 }
 
-fn percent_decode_str(input: &str) -> String {
-    let mut result = Vec::new();
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16)
-        {
-            result.push(byte);
-            i += 3;
-            continue;
-        }
-        result.push(bytes[i]);
-        i += 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+
+    fn load_json_fixture() -> Vec<u8> {
+        std::fs::read("tests/data/pypi/requests.json").expect("fixture missing")
     }
-    String::from_utf8(result).unwrap_or_else(|_| input.to_string())
-}
 
-fn extract_href(anchor: &str) -> Option<String> {
-    let href_start = anchor.find("href=\"")? + 6;
-    let href_end = anchor[href_start..].find('"')?;
-    Some(anchor[href_start..href_start + href_end].to_string())
+    #[test]
+    fn pypi_rewrite_json_against_real_metadata() {
+        let registry = PyPIRegistry::new(Rules::new(365 * 24));
+
+        let body = load_json_fixture();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let url = Url::parse("https://pypi.org/pypi/requests/json").unwrap();
+
+        let original: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let original_count = original["releases"].as_object().unwrap().len();
+
+        let action = registry.handle_response(&url, 200, &headers, &body);
+
+        let new_body = match action {
+            ResponseAction::Rewrite { body } => body,
+            _ => panic!("expected rewrite, got {:?}", action),
+        };
+
+        let result: serde_json::Value = serde_json::from_slice(&new_body).unwrap();
+        let result_count = result["releases"].as_object().map(|o| o.len()).unwrap_or(0);
+
+        assert!(
+            result_count < original_count,
+            "should have stripped some versions ({} vs {})",
+            result_count,
+            original_count,
+        );
+
+        assert_eq!(
+            result["info"]["name"].as_str(),
+            Some("requests"),
+            "package info should be preserved",
+        );
+
+        let stats = registry.stats();
+        assert_eq!(stats.packages_checked, 1);
+    }
+
+    #[test]
+    fn pypi_passthrough_for_tarball() {
+        let registry = PyPIRegistry::new(Rules::new(48));
+        let url = Url::parse("https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz").unwrap();
+        let action = registry.handle_response(&url, 200, &HeaderMap::new(), b"data");
+        assert!(matches!(action, ResponseAction::Passthrough));
+    }
+
+    #[test]
+    fn pypi_blocks_compressed_metadata() {
+        let registry = PyPIRegistry::new(Rules::new(48));
+        let url = Url::parse("https://pypi.org/pypi/requests/json").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        let action = registry.handle_response(&url, 200, &headers, b"compressed data");
+        assert!(matches!(action, ResponseAction::Block));
+    }
+
+    #[test]
+    fn pypi_blocks_html_simple_index() {
+        let registry = PyPIRegistry::new(Rules::new(48));
+        let url = Url::parse("https://pypi.org/simple/requests/").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/html"));
+        let action = registry.handle_response(&url, 200, &headers, b"<html><body><a href=\"foo.tar.gz\">foo</a></body></html>");
+        assert!(matches!(action, ResponseAction::Block));
+    }
+
+    #[test]
+    fn pypi_blocks_unknown_content_type() {
+        let registry = PyPIRegistry::new(Rules::new(48));
+        let url = Url::parse("https://pypi.org/pypi/requests/json").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        let action = registry.handle_response(&url, 200, &headers, b"some text");
+        assert!(matches!(action, ResponseAction::Block));
+    }
+
+    #[test]
+    fn version_timestamp_uses_latest_file() {
+        let files = vec![
+            PyPIFile {
+                filename: "pkg-1.0.tar.gz".to_string(),
+                upload_time_iso_8601: Some("2020-01-01T00:00:00Z".to_string()),
+                digests: None,
+                md5_digest: None,
+                yanked: false,
+                yanked_reason: None,
+                packagetype: "sdist".to_string(),
+                size: None,
+                requires_python: None,
+                extra: Map::new(),
+            },
+            PyPIFile {
+                filename: "pkg-1.0-py3-none-any.whl".to_string(),
+                upload_time_iso_8601: Some("2025-06-01T00:00:00Z".to_string()),
+                digests: None,
+                md5_digest: None,
+                yanked: false,
+                yanked_reason: None,
+                packagetype: "bdist_wheel".to_string(),
+                size: None,
+                requires_python: None,
+                extra: Map::new(),
+            },
+        ];
+        let ts = PyPIRegistry::version_timestamp(&files).unwrap();
+        assert_eq!(ts, "2025-06-01T00:00:00Z".parse::<Timestamp>().unwrap());
+    }
 }

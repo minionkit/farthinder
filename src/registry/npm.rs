@@ -1,31 +1,23 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use http::HeaderMap;
-use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
-use tracing::debug;
 use url::Url;
 
-use super::{QuarantinedPackage, QuarantinedVersion, Registry, RegistryStats, ResponseAction};
+use super::{reject_compressed, CutoffChecker, QuarantinedPackage, Registry, RegistryState, RegistryStats, ResponseAction};
 use crate::rule::Rules;
 
 pub struct NpmRegistry {
-    cutoff: Timestamp,
-    state: Mutex<NpmState>,
+    checker: CutoffChecker,
+    state: Mutex<RegistryState>,
 }
 
 #[cfg(test)]
 impl NpmRegistry {
-    pub fn test_cutoff(&self) -> Timestamp {
-        self.cutoff
+    pub fn test_cutoff(&self) -> jiff::Timestamp {
+        self.checker.cutoff()
     }
-}
-
-struct NpmState {
-    packages_checked: usize,
-    quarantined: Vec<QuarantinedPackage>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -43,23 +35,15 @@ const KNOWN_HOSTS: &[&str] = &["registry.npmjs.org", "registry.yarnpkg.com"];
 
 impl NpmRegistry {
     pub fn new(rules: Rules) -> Self {
-        let cutoff = Timestamp::now() - jiff::Span::new().hours(rules.min_age_hours() as i64);
         NpmRegistry {
-            cutoff,
-            state: Mutex::new(NpmState {
-                packages_checked: 0,
-                quarantined: Vec::new(),
-            }),
+            checker: CutoffChecker::new(rules.min_age_hours()),
+            state: Mutex::new(RegistryState::default()),
         }
     }
 
-    fn is_metadata_url(&self, url: &Url) -> bool {
+    fn is_metadata_url(url: &Url) -> bool {
         let path = url.path().split('?').next().unwrap_or("");
         !path.ends_with(".tgz") && !path.contains("/-/")
-    }
-
-    fn check_version(&self, _name: &str, _version: &str, published_at: Option<Timestamp>) -> bool {
-        matches!(published_at, Some(t) if t <= self.cutoff)
     }
 }
 
@@ -68,8 +52,8 @@ impl Registry for NpmRegistry {
         KNOWN_HOSTS
     }
 
-    fn prepare_request(&self, url: &Url, headers: &mut HeaderMap) {
-        if !self.is_metadata_url(url) {
+    fn prepare_request(&self, url: &Url, headers: &mut http::HeaderMap) {
+        if !Self::is_metadata_url(url) {
             return;
         }
         headers.insert("accept", "application/json".parse().unwrap());
@@ -80,21 +64,15 @@ impl Registry for NpmRegistry {
         &self,
         url: &Url,
         _status: u16,
-        response_headers: &HeaderMap,
+        response_headers: &http::HeaderMap,
         body: &[u8],
     ) -> ResponseAction {
-        if !self.is_metadata_url(url) {
+        if !Self::is_metadata_url(url) {
             return ResponseAction::Passthrough;
         }
 
-        let content_encoding = response_headers
-            .get("content-encoding")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("none");
-
-        if content_encoding != "none" && content_encoding != "identity" {
-            debug!("compressed npm metadata response, blocking");
-            return ResponseAction::Block;
+        if let Some(action) = reject_compressed(response_headers) {
+            return action;
         }
 
         let mut meta: NpmMetadata = match serde_json::from_slice(body) {
@@ -109,18 +87,17 @@ impl Registry for NpmRegistry {
             if version == "created" || version == "modified" {
                 continue;
             }
-            let published_at: Option<Timestamp> = ts_str.parse().ok();
-            if !self.check_version(&meta.name, version, published_at) {
+            let published_at = ts_str.parse::<jiff::Timestamp>().ok();
+            if !self.checker.is_old_enough(published_at) {
                 to_remove.push(version.clone());
-                quarantined_versions.push(QuarantinedVersion {
-                    version: version.clone(),
-                    published_at,
-                });
+                quarantined_versions.push(version.clone());
             }
         }
 
-        let mut state = self.state.lock().unwrap();
-        state.packages_checked += 1;
+        {
+            let mut state = self.state.lock().expect("npm state lock");
+            state.packages_checked += 1;
+        }
 
         if to_remove.is_empty() {
             return ResponseAction::Passthrough;
@@ -138,24 +115,37 @@ impl Registry for NpmRegistry {
             meta.dist_tags.insert("latest".into(), latest);
         }
 
-        state.quarantined.push(QuarantinedPackage {
-            name: meta.name.clone(),
-            quarantined_versions,
-        });
+        {
+            let mut state = self.state.lock().expect("npm state lock");
+            state.quarantined.push(QuarantinedPackage {
+                name: meta.name.clone(),
+                quarantined_versions,
+            });
+        }
 
         match serde_json::to_vec(&meta) {
             Ok(new_body) => ResponseAction::Rewrite { body: new_body },
-            Err(_) => ResponseAction::Passthrough,
+            Err(_) => ResponseAction::Block,
         }
     }
 
     fn stats(&self) -> RegistryStats {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("npm state lock");
         RegistryStats {
             packages_checked: state.packages_checked,
             packages_quarantined: state.quarantined.clone(),
             ..Default::default()
         }
+    }
+
+    fn proxy_env_vars(&self, proxy_url: &str, ca_cert_path: &std::path::Path) -> Vec<(String, String)> {
+        vec![
+            ("npm_config_proxy".to_string(), proxy_url.to_string()),
+            ("npm_config_https_proxy".to_string(), proxy_url.to_string()),
+            ("HTTP_PROXY".to_string(), proxy_url.to_string()),
+            ("HTTPS_PROXY".to_string(), proxy_url.to_string()),
+            ("NODE_EXTRA_CA_CERTS".to_string(), ca_cert_path.to_string_lossy().to_string()),
+        ]
     }
 }
 
@@ -180,7 +170,7 @@ mod tests {
         let cutoff = registry.test_cutoff();
 
         let body = load_fixture();
-        let headers = HeaderMap::new();
+        let headers = http::HeaderMap::new();
         let url = Url::parse("https://registry.npmjs.org/express").unwrap();
 
         let action = registry.handle_response(&url, 200, &headers, &body);
@@ -196,7 +186,7 @@ mod tests {
             if version == "created" || version == "modified" {
                 continue;
             }
-            let ts: Timestamp = ts_str.parse().unwrap();
+            let ts: jiff::Timestamp = ts_str.parse().unwrap();
             assert!(
                 ts <= cutoff,
                 "remaining version {version} ({ts}) is newer than cutoff ({cutoff})"
@@ -224,7 +214,7 @@ mod tests {
     fn npm_passthrough_for_tarball() {
         let registry = NpmRegistry::new(Rules::new(48));
         let url = Url::parse("https://registry.npmjs.org/express/-/express-4.18.2.tgz").unwrap();
-        let action = registry.handle_response(&url, 200, &HeaderMap::new(), b"data");
+        let action = registry.handle_response(&url, 200, &http::HeaderMap::new(), b"data");
         assert!(matches!(action, ResponseAction::Passthrough));
     }
 
@@ -232,7 +222,7 @@ mod tests {
     fn npm_blocks_compressed_metadata() {
         let registry = NpmRegistry::new(Rules::new(48));
         let url = Url::parse("https://registry.npmjs.org/express").unwrap();
-        let mut headers = HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.insert("content-encoding", "gzip".parse().unwrap());
         let action = registry.handle_response(&url, 200, &headers, b"compressed data");
         assert!(matches!(action, ResponseAction::Block));
