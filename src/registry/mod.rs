@@ -86,6 +86,27 @@ pub struct BlockedItem {
     pub version: String,
 }
 
+pub enum InterceptDecision {
+    Passthrough(Vec<String>),
+    Intercept(Vec<String>),
+}
+
+impl Ecosystem {
+    pub fn decide(&self, tool: ToolName, args: Vec<String>) -> InterceptDecision {
+        match self {
+            Ecosystem::Javascript => npm::decide(tool, args),
+            Ecosystem::Python => pypi::decide(tool, args),
+        }
+    }
+
+    pub fn registry(&self, rules: Rules) -> Box<dyn Registry> {
+        match self {
+            Ecosystem::Javascript => Box::new(npm::NpmRegistry::new(rules)),
+            Ecosystem::Python => Box::new(pypi::PyPIRegistry::new(rules)),
+        }
+    }
+}
+
 pub trait Registry: Send + Sync {
     fn known_hosts(&self) -> &[&str];
     fn prepare_request(&self, url: &Url, headers: &mut HeaderMap);
@@ -98,15 +119,6 @@ pub trait Registry: Send + Sync {
     ) -> ResponseAction;
     fn stats(&self) -> RegistryStats;
     fn proxy_env_vars(&self, proxy_url: &str, ca_cert_path: &Path) -> Vec<(String, String)>;
-}
-
-impl Ecosystem {
-    pub fn registry(&self, rules: Rules) -> Box<dyn Registry> {
-        match self {
-            Ecosystem::Javascript => Box::new(npm::NpmRegistry::new(rules)),
-            Ecosystem::Python => Box::new(pypi::PyPIRegistry::new(rules)),
-        }
-    }
 }
 
 pub(crate) struct CutoffChecker {

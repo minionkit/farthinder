@@ -7,8 +7,64 @@ use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use url::Url;
 
-use super::{reject_compressed, CutoffChecker, QuarantinedPackage, Registry, RegistryState, RegistryStats, ResponseAction};
+use super::{reject_compressed, InterceptDecision, CutoffChecker, QuarantinedPackage, Registry, RegistryState, RegistryStats, ResponseAction, ToolName};
 use crate::rule::Rules;
+
+const PIPX_INSTALL_SUBCOMMANDS: &[&str] = &[
+    "install", "run", "upgrade", "upgrade-all", "inject", "reinstall", "reinstall-all",
+];
+const POETRY_INSTALL_SUBCOMMANDS: &[&str] = &["install", "add", "update", "lock"];
+
+pub fn decide(tool: ToolName, args: Vec<String>) -> InterceptDecision {
+    match tool {
+        ToolName::Uvx => InterceptDecision::Intercept(args),
+        ToolName::Pip | ToolName::Pip3 => {
+            let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
+            if subcmd == "install" {
+                InterceptDecision::Intercept(args)
+            } else {
+                InterceptDecision::Passthrough(args)
+            }
+        }
+        ToolName::Uv => {
+            let first = args.first().map(|s| s.as_str()).unwrap_or("");
+            match first {
+                "sync" | "lock" | "add" => InterceptDecision::Intercept(args),
+                "run" => {
+                    let mut hardened = vec!["--frozen".to_string()];
+                    hardened.extend(args);
+                    InterceptDecision::Intercept(hardened)
+                }
+                "pip" => {
+                    let second = args.get(1).map(|s| s.as_str()).unwrap_or("");
+                    if second == "install" {
+                        InterceptDecision::Intercept(args)
+                    } else {
+                        InterceptDecision::Passthrough(args)
+                    }
+                }
+                _ => InterceptDecision::Passthrough(args),
+            }
+        }
+        ToolName::Pipx => {
+            let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
+            if PIPX_INSTALL_SUBCOMMANDS.contains(&subcmd) {
+                InterceptDecision::Intercept(args)
+            } else {
+                InterceptDecision::Passthrough(args)
+            }
+        }
+        ToolName::Poetry => {
+            let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
+            if POETRY_INSTALL_SUBCOMMANDS.contains(&subcmd) {
+                InterceptDecision::Intercept(args)
+            } else {
+                InterceptDecision::Passthrough(args)
+            }
+        }
+        _ => InterceptDecision::Passthrough(args),
+    }
+}
 
 pub struct PyPIRegistry {
     checker: CutoffChecker,
@@ -382,5 +438,37 @@ mod tests {
         ];
         let ts = PyPIRegistry::version_timestamp(&files).unwrap();
         assert_eq!(ts, "2025-06-01T00:00:00Z".parse::<Timestamp>().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod decide_tests {
+    use test_case::test_case;
+    use crate::registry::{Ecosystem, InterceptDecision, ToolName};
+
+    fn decide(tool: &str, args: &[&str]) -> InterceptDecision {
+        let tool: ToolName = tool.parse().unwrap();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        Ecosystem::Python.decide(tool, args)
+    }
+
+    #[test_case("uv", &["run", "python", "script.py"] => true)]
+    #[test_case("uv", &["pip", "install", "requests"] => true)]
+    #[test_case("uv", &["sync"] => true)]
+    #[test_case("uv", &["pip", "list"] => false)]
+    #[test_case("pip", &["install", "requests"] => true)]
+    #[test_case("pip", &["list"] => false)]
+    #[test_case("poetry", &["build"] => false)]
+    fn python_intercepts(tool: &str, args: &[&str]) -> bool {
+        matches!(decide(tool, args), InterceptDecision::Intercept(_))
+    }
+
+    #[test_case("uv", &["run", "python", "script.py"], &["--frozen", "run", "python", "script.py"])]
+    #[test_case("uv", &["pip", "install", "requests"], &["pip", "install", "requests"])]
+    fn python_intercepted_args(tool: &str, args: &[&str], expected: &[&str]) {
+        let InterceptDecision::Intercept(got) = decide(tool, args) else {
+            panic!("{tool} {args:?}: expected Intercept");
+        };
+        assert_eq!(got, expected.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     }
 }

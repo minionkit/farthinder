@@ -21,8 +21,8 @@ impl Printer {
             Ecosystem::Javascript => "npm",
             Ecosystem::Python => "PyPI",
         };
-        let content = format!("Watching [bold cyan]{}[/] traffic", label);
-        self.styled_panel("Farthinder", "cyan", &content);
+        let content = format!("Protecting [bold cyan]{}[/]", label);
+        self.styled_panel("Farthinder Active", "cyan", &content);
     }
 
     pub fn summary(&self, stats: &RegistryStats) {

@@ -5,8 +5,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use url::Url;
 
-use super::{reject_compressed, CutoffChecker, QuarantinedPackage, Registry, RegistryState, RegistryStats, ResponseAction};
+use super::{reject_compressed, InterceptDecision, CutoffChecker, QuarantinedPackage, Registry, RegistryState, RegistryStats, ResponseAction, ToolName};
 use crate::rule::Rules;
+
+const JS_INSTALL_SUBCOMMANDS: &[&str] = &["install", "i", "ci", "add", "update", "upgrade"];
+
+pub fn decide(tool: ToolName, args: Vec<String>) -> InterceptDecision {
+    match tool {
+        ToolName::Npx | ToolName::Bunx => InterceptDecision::Intercept(args),
+        ToolName::Npm | ToolName::Bun | ToolName::Yarn | ToolName::Pnpm => {
+            let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
+            if subcmd.is_empty() && matches!(tool, ToolName::Yarn | ToolName::Pnpm) {
+                return InterceptDecision::Intercept(args);
+            }
+            if JS_INSTALL_SUBCOMMANDS.contains(&subcmd) {
+                InterceptDecision::Intercept(args)
+            } else {
+                InterceptDecision::Passthrough(args)
+            }
+        }
+        _ => InterceptDecision::Passthrough(args),
+    }
+}
 
 pub struct NpmRegistry {
     checker: CutoffChecker,
@@ -226,5 +246,26 @@ mod tests {
         headers.insert("content-encoding", "gzip".parse().unwrap());
         let action = registry.handle_response(&url, 200, &headers, b"compressed data");
         assert!(matches!(action, ResponseAction::Block));
+    }
+}
+
+#[cfg(test)]
+mod decide_tests {
+    use test_case::test_case;
+    use crate::registry::{Ecosystem, InterceptDecision, ToolName};
+
+    fn decide(tool: &str, args: &[&str]) -> InterceptDecision {
+        let tool: ToolName = tool.parse().unwrap();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        Ecosystem::Javascript.decide(tool, args)
+    }
+
+    #[test_case("npx",  &["create-react-app", "my-app"] => true)]
+    #[test_case("npm",  &["install", "--save-dev", "jest"] => true)]
+    #[test_case("yarn", &[] => true)]
+    #[test_case("npm",  &[] => false)]
+    #[test_case("bun",  &["run", "dev"] => false)]
+    fn js_intercepts(tool: &str, args: &[&str]) -> bool {
+        matches!(decide(tool, args), InterceptDecision::Intercept(_))
     }
 }

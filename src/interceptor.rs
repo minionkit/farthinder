@@ -12,7 +12,7 @@ use tracing::debug;
 use crate::config;
 use crate::printer::Printer;
 use crate::proxy::ProxyServer;
-use crate::registry::{Ecosystem, Registry, ToolName};
+use crate::registry::{Ecosystem, InterceptDecision, Registry, ToolName};
 use crate::rule::Rules;
 use crate::sandbox::{self, SandboxPolicy, WrappedCommand};
 
@@ -20,6 +20,7 @@ use crate::sandbox::{self, SandboxPolicy, WrappedCommand};
 pub struct Interceptor {
     target: PathBuf,
     arg0: String,
+    tool: Option<ToolName>,
     ecosystem: Option<Ecosystem>,
 }
 
@@ -33,33 +34,53 @@ impl Interceptor {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid exe name"))?;
         let target = find_target_executable(tool_name)?;
-        let ecosystem = tool_name
-            .parse::<ToolName>()
-            .ok()
-            .and_then(|t| t.ecosystem());
+        let tool = tool_name.parse::<ToolName>().ok();
+        let ecosystem = tool.and_then(|t| t.ecosystem());
         Ok(Interceptor {
             target,
             arg0,
+            tool,
             ecosystem,
         })
     }
 
     pub async fn run(&self) -> anyhow::Result<ExitStatus> {
-        let Some(ecosystem) = &self.ecosystem else {
-            let mut cmd = Command::new(&self.target);
-            cmd.arg0(&self.arg0).args(env::args().skip(1));
-            return cmd.status().context("execute command");
+        let args: Vec<String> = env::args().skip(1).collect();
+
+        let decision = match (self.tool, self.ecosystem) {
+            (Some(tool), Some(eco)) => eco.decide(tool, args),
+            _ => {
+                let mut cmd = Command::new(&self.target);
+                cmd.arg0(&self.arg0).args(&args);
+                let e = cmd.exec();
+                return Err(e.into());
+            }
         };
 
+        match decision {
+            InterceptDecision::Passthrough(args) => {
+                let mut cmd = Command::new(&self.target);
+                cmd.arg0(&self.arg0).args(&args);
+                let e = cmd.exec();
+                Err(e.into())
+            }
+            InterceptDecision::Intercept(args) => {
+                self.run_intercepted(args).await
+            }
+        }
+    }
+
+    async fn run_intercepted(&self, args: Vec<String>) -> anyhow::Result<ExitStatus> {
+        let eco = self.ecosystem.unwrap();
         let cfg = config::load()?;
         debug!("config: min_age_hours={}, sandbox_required={}", cfg.min_age_hours, cfg.sandbox_required);
 
         let rules = Rules::new(cfg.min_age_hours);
-        let registry: Arc<dyn Registry> = Arc::from(ecosystem.registry(rules));
+        let registry: Arc<dyn Registry> = Arc::from(eco.registry(rules));
         let proxy = ProxyServer::spawn(registry.clone()).await?;
         let printer = Printer::new();
 
-        printer.banner(*ecosystem);
+        printer.banner(eco);
 
         let ca_cert_path = write_ca_cert_temp(&proxy.ca_cert_pem)?;
         let proxy_port = proxy.port();
@@ -87,7 +108,7 @@ impl Interceptor {
 
             let wrapped = WrappedCommand {
                 program: self.target.to_string_lossy().to_string(),
-                args: env::args().skip(1).collect(),
+                args,
                 env: proxy_env,
             };
 
@@ -98,7 +119,7 @@ impl Interceptor {
         } else {
             let wrapped = WrappedCommand {
                 program: self.target.to_string_lossy().to_string(),
-                args: env::args().skip(1).collect(),
+                args,
                 env: proxy_env,
             };
             let mut cmd = build_command(&wrapped, &self.arg0);
