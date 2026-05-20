@@ -1,3 +1,7 @@
 /target
 WIP
 test
+
+# moon
+.moon/cache
+.moon/docker

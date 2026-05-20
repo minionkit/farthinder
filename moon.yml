@@ -1,0 +1,33 @@
+fileGroups:
+  sources:
+    - 'src/**/*'
+  configs:
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+
+tasks:
+  check:
+    command: 'cargo check'
+    inputs:
+      - '@group(sources)'
+      - '@group(configs)'
+
+  clippy:
+    command: 'cargo clippy'
+    inputs:
+      - '@group(sources)'
+      - '@group(configs)'
+
+  test:
+    command: 'cargo test'
+    inputs:
+      - '@group(sources)'
+      - '@group(configs)'
+
+  build:
+    command: 'cargo build --release'
+    inputs:
+      - '@group(sources)'
+      - '@group(configs)'
+    outputs:
+      - 'target/release/fart'

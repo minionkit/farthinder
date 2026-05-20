@@ -1,0 +1,6 @@
+moon = "2.2.4"
+zig = "0.16.0"
+rust = "1.95.0"
+
+[plugins.tools]
+zig = "github://konomae/zig-plugin"

@@ -1,0 +1,6 @@
+projects:
+  farthinder: '.'
+
+vcs:
+  defaultBranch: "main"
+  provider: "other"
