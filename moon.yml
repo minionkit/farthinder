@@ -1,33 +1,95 @@
 fileGroups:
   sources:
-    - 'src/**/*'
+    - "src/**/*"
   configs:
-    - 'Cargo.toml'
-    - 'Cargo.lock'
+    - "Cargo.toml"
+    - "Cargo.lock"
 
 tasks:
   check:
-    command: 'cargo check'
+    command: "cargo check"
     inputs:
-      - '@group(sources)'
-      - '@group(configs)'
+      - "@group(sources)"
+      - "@group(configs)"
 
   clippy:
-    command: 'cargo clippy'
+    command: "cargo clippy"
     inputs:
-      - '@group(sources)'
-      - '@group(configs)'
+      - "@group(sources)"
+      - "@group(configs)"
 
   test:
-    command: 'cargo test'
+    command: "cargo test"
     inputs:
-      - '@group(sources)'
-      - '@group(configs)'
+      - "@group(sources)"
+      - "@group(configs)"
 
   build:
-    command: 'cargo build --release'
+    command: "cargo build --release"
     inputs:
-      - '@group(sources)'
-      - '@group(configs)'
+      - "@group(sources)"
+      - "@group(configs)"
     outputs:
-      - 'target/release/fart'
+      - "target/release/fart"
+
+  dist-linux-amd64:
+    command: "cargo zigbuild --release --target x86_64-unknown-linux-gnu"
+    inputs:
+      - "@group(sources)"
+      - "@group(configs)"
+    outputs:
+      - "target/x86_64-unknown-linux-gnu/release/fart"
+
+  dist-linux-arm64:
+    command: "cargo zigbuild --release --target aarch64-unknown-linux-gnu"
+    inputs:
+      - "@group(sources)"
+      - "@group(configs)"
+    outputs:
+      - "target/aarch64-unknown-linux-gnu/release/fart"
+
+  dist-macos-amd64:
+    command: "cargo zigbuild --release --target x86_64-apple-darwin"
+    inputs:
+      - "@group(sources)"
+      - "@group(configs)"
+    outputs:
+      - "target/x86_64-apple-darwin/release/fart"
+
+  dist-macos-arm64:
+    command: "cargo zigbuild --release --target aarch64-apple-darwin"
+    inputs:
+      - "@group(sources)"
+      - "@group(configs)"
+    outputs:
+      - "target/aarch64-apple-darwin/release/fart"
+
+  dist:
+    command: 'echo "all targets built"'
+    deps:
+      - dist-linux-amd64
+      - dist-linux-arm64
+      - dist-macos-amd64
+      - dist-macos-arm64
+
+  publish:
+    script: |
+      #!/usr/bin/env bash
+      VERSION="v$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
+      mkdir -p target/publish
+
+      cp target/x86_64-unknown-linux-gnu/release/fart target/publish/fart-linux-amd64
+      cp target/aarch64-unknown-linux-gnu/release/fart target/publish/fart-linux-arm64
+      cp target/x86_64-apple-darwin/release/fart target/publish/fart-macos-amd64
+      cp target/aarch64-apple-darwin/release/fart target/publish/fart-macos-arm64
+
+      gh release create --title "$VERSION" \
+        "target/publish/fart-linux-amd64#Farthinder Linux (x86_64)" \
+        "target/publish/fart-linux-arm64#Farthinder Linux (arm64)" \
+        "target/publish/fart-macos-amd64#Farthinder macOS (x86_64)" \
+        "target/publish/fart-macos-arm64#Farthinder macOS (arm64)" \
+        --draft
+    deps:
+      - dist
+    options:
+      cache: false

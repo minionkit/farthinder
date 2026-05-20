@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use landlock::{Access, Compatible, RulesetAttr, RulesetCreatedAttr};
+
 use super::{SandboxEnforcer, SandboxPolicy, WrappedCommand};
 
 pub struct LandlockEnforcer;
@@ -87,7 +89,7 @@ impl SandboxEnforcer for LandlockEnforcer {
                     .take()
                     .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Other))?;
 
-                ruleset.restrict_self().map_err(|_| {
+                ruleset.restrict_self().map(|_| ()).map_err(|_| {
                     std::io::Error::from(std::io::ErrorKind::PermissionDenied)
                 })
             });

@@ -10,6 +10,7 @@ pub struct SandboxPolicy {
     pub proxy_port: u16,
     pub cwd: PathBuf,
     pub home: PathBuf,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub sensitive_paths: Vec<PathBuf>,
 }
 
